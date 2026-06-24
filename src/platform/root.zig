@@ -531,7 +531,10 @@ pub const PlatformServices = struct {
     }
 
     pub fn configureShortcuts(self: PlatformServices, shortcuts: []const Shortcut) anyerror!void {
-        const configure_fn = self.configure_shortcuts_fn orelse return;
+        const configure_fn = self.configure_shortcuts_fn orelse {
+            if (shortcuts.len == 0) return;
+            return error.UnsupportedService;
+        };
         return configure_fn(self.context, shortcuts);
     }
 
@@ -1015,6 +1018,16 @@ test "webview bridge fallback only routes main responses" {
     try std.testing.expectEqual(@as(WindowId, 3), recorder.window_id);
     try std.testing.expectEqualStrings("{\"ok\":true}", recorder.response);
     try std.testing.expectError(error.UnsupportedService, services.completeWebViewBridge(3, "preview", "{\"ok\":true}"));
+}
+
+test "shortcut configuration requires backend support for non-empty lists" {
+    const services = PlatformServices{};
+    try services.configureShortcuts(&.{});
+
+    const shortcuts = [_]Shortcut{
+        .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true } },
+    };
+    try std.testing.expectError(error.UnsupportedService, services.configureShortcuts(&shortcuts));
 }
 
 test "null platform records webview lifecycle" {

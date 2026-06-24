@@ -1381,6 +1381,7 @@ static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event) {
         case 0x1b: return @"escape";
         case '\r': return @"enter";
         case '\t': return @"tab";
+        case NSBackTabCharacter: return @"tab";
         case ' ': return @"space";
         case 0x7f: return @"backspace";
         case '!': return @"1";
