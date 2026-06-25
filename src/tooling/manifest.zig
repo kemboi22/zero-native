@@ -25,6 +25,7 @@ pub const Metadata = struct {
     security: SecurityMetadata = .{},
     windows: []const WindowMetadata = &.{},
     shell: ShellMetadata = .{},
+    commands: []const CommandMetadata = &.{},
     menus: []const MenuMetadata = &.{},
     shortcuts: []const ShortcutMetadata = &.{},
     file_associations: []const FileAssociationMetadata = &.{},
@@ -97,6 +98,11 @@ pub const Metadata = struct {
             if (window.views.len > 0) allocator.free(window.views);
         }
         if (self.shell.windows.len > 0) allocator.free(self.shell.windows);
+        for (self.commands) |command| {
+            allocator.free(command.id);
+            allocator.free(command.title);
+        }
+        if (self.commands.len > 0) allocator.free(self.commands);
         for (self.menus) |menu| {
             allocator.free(menu.title);
             for (menu.items) |item| {
@@ -197,6 +203,13 @@ pub const ShortcutMetadata = struct {
     modifiers: []const []const u8 = &.{},
 };
 
+pub const CommandMetadata = struct {
+    id: []const u8,
+    title: []const u8 = "",
+    enabled: bool = true,
+    checked: bool = false,
+};
+
 pub const MenuMetadata = struct {
     title: []const u8,
     items: []const MenuItemMetadata = &.{},
@@ -265,6 +278,7 @@ const RawWindow = raw_manifest.RawWindow;
 const RawShell = raw_manifest.RawShell;
 const RawShellWindow = raw_manifest.RawShellWindow;
 const RawShellView = raw_manifest.RawShellView;
+const RawCommand = raw_manifest.RawCommand;
 const RawMenu = raw_manifest.RawMenu;
 const RawMenuItem = raw_manifest.RawMenuItem;
 const RawShortcut = raw_manifest.RawShortcut;
@@ -294,6 +308,8 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     defer allocator.free(windows);
     const shell = parseShell(allocator, metadata.shell) catch return .{ .ok = false, .message = "app.zon shell is invalid" };
     defer deinitParsedShell(allocator, shell);
+    const commands = parseCommands(allocator, metadata.commands) catch return .{ .ok = false, .message = "app.zon commands are invalid" };
+    defer allocator.free(commands);
     const menus = parseMenus(allocator, metadata.menus) catch return .{ .ok = false, .message = "app.zon menus are invalid" };
     defer deinitParsedMenus(allocator, menus);
     const shortcuts = parseShortcuts(allocator, metadata.shortcuts) catch return .{ .ok = false, .message = "app.zon shortcuts are invalid" };
@@ -315,6 +331,7 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         .platforms = parsePlatformSettings(allocator, metadata.platforms) catch return .{ .ok = false, .message = "app.zon platforms are invalid" },
         .windows = windows,
         .shell = shell,
+        .commands = commands,
         .menus = menus,
         .shortcuts = shortcuts,
         .file_associations = file_associations,
@@ -358,6 +375,7 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Metadata {
         .security = try convertRawSecurity(allocator, raw.security),
         .windows = try convertRawWindows(allocator, raw.windows),
         .shell = try convertRawShell(allocator, raw.shell),
+        .commands = try convertRawCommands(allocator, raw.commands),
         .menus = try convertRawMenus(allocator, raw.menus),
         .shortcuts = try convertRawShortcuts(allocator, raw.shortcuts),
         .file_associations = try convertRawFileAssociations(allocator, raw.file_associations),
@@ -503,6 +521,20 @@ fn convertRawShortcuts(allocator: std.mem.Allocator, shortcuts: []const RawShort
             .id = try allocator.dupe(u8, shortcut.id),
             .key = try allocator.dupe(u8, shortcut.key),
             .modifiers = try duplicateStringList(allocator, shortcut.modifiers),
+        };
+    }
+    return converted;
+}
+
+fn convertRawCommands(allocator: std.mem.Allocator, commands: []const RawCommand) ![]const CommandMetadata {
+    if (commands.len == 0) return &.{};
+    const converted = try allocator.alloc(CommandMetadata, commands.len);
+    for (commands, 0..) |command, index| {
+        converted[index] = .{
+            .id = try allocator.dupe(u8, command.id),
+            .title = try allocator.dupe(u8, command.title),
+            .enabled = command.enabled,
+            .checked = command.checked,
         };
     }
     return converted;
@@ -805,6 +837,21 @@ fn parseShortcuts(allocator: std.mem.Allocator, values: []const ShortcutMetadata
     return shortcuts.toOwnedSlice(allocator);
 }
 
+fn parseCommands(allocator: std.mem.Allocator, values: []const CommandMetadata) ![]const app_manifest.Command {
+    if (values.len == 0) return &.{};
+    var commands: std.ArrayList(app_manifest.Command) = .empty;
+    errdefer commands.deinit(allocator);
+    for (values) |value| {
+        try commands.append(allocator, .{
+            .id = value.id,
+            .title = value.title,
+            .enabled = value.enabled,
+            .checked = value.checked,
+        });
+    }
+    return commands.toOwnedSlice(allocator);
+}
+
 fn parseMenus(allocator: std.mem.Allocator, values: []const MenuMetadata) ![]const app_manifest.Menu {
     if (values.len == 0) return &.{};
     var menus: std.ArrayList(app_manifest.Menu) = .empty;
@@ -1014,6 +1061,10 @@ test "manifest metadata parser reads identity version and lists" {
         \\  .bridge = .{ .commands = .{ .{ .name = "native.ping" } } },
         \\  .web_engine = "chromium",
         \\  .cef = .{ .dir = "third_party/cef/macos", .auto_install = true },
+        \\  .commands = .{
+        \\    .{ .id = "app.refresh", .title = "Refresh" },
+        \\    .{ .id = "app.sidebar.toggle", .title = "Sidebar", .checked = true },
+        \\  },
         \\  .menus = .{
         \\    .{
         \\      .title = "View",
@@ -1062,6 +1113,10 @@ test "manifest metadata parser reads identity version and lists" {
     try std.testing.expectEqual(app_manifest.CapabilityKind.recent_documents, parsed_capabilities[14].kind());
     try std.testing.expectEqual(app_manifest.CapabilityKind.app_activation_events, parsed_capabilities[15].kind());
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
+    try std.testing.expectEqualStrings("app.refresh", metadata.commands[0].id);
+    try std.testing.expectEqualStrings("Refresh", metadata.commands[0].title);
+    try std.testing.expect(metadata.commands[0].enabled);
+    try std.testing.expect(metadata.commands[1].checked);
     try std.testing.expectEqualStrings("View", metadata.menus[0].title);
     try std.testing.expectEqualStrings("Refresh", metadata.menus[0].items[0].label);
     try std.testing.expectEqualStrings("app.refresh", metadata.menus[0].items[0].command);
@@ -1086,9 +1141,12 @@ test "manifest metadata parser reads identity version and lists" {
     defer std.testing.allocator.free(schemes);
     const menus = try parseMenus(std.testing.allocator, metadata.menus);
     defer deinitParsedMenus(std.testing.allocator, menus);
+    const commands = try parseCommands(std.testing.allocator, metadata.commands);
+    defer std.testing.allocator.free(commands);
     try app_manifest.validateManifest(.{
         .identity = .{ .id = metadata.id, .name = metadata.name },
         .version = try parseVersion(metadata.version),
+        .commands = commands,
         .menus = menus,
         .file_associations = associations,
         .url_schemes = schemes,

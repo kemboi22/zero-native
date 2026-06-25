@@ -16,6 +16,7 @@ pub const RawManifest = struct {
     security: RawSecurity = .{},
     windows: []const RawWindow = &.{},
     shell: RawShell = .{},
+    commands: []const RawCommand = &.{},
     menus: []const RawMenu = &.{},
     shortcuts: []const RawShortcut = &.{},
     file_associations: []const RawFileAssociation = &.{},
@@ -120,6 +121,13 @@ pub const RawShortcut = struct {
     id: []const u8,
     key: []const u8,
     modifiers: []const []const u8 = &.{},
+};
+
+pub const RawCommand = struct {
+    id: []const u8,
+    title: []const u8 = "",
+    enabled: bool = true,
+    checked: bool = false,
 };
 
 pub const RawMenu = struct {

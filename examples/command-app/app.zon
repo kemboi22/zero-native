@@ -7,6 +7,9 @@
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "command" },
     .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts", "tray" },
+    .commands = .{
+        .{ .id = "app.sync", .title = "Sync" },
+    },
     .shortcuts = .{
         .{ .id = "app.sync", .key = "s", .modifiers = .{ "primary" } },
     },

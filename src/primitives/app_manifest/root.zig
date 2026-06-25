@@ -9,6 +9,7 @@ pub const ValidationError = error{
     DuplicatePermission,
     DuplicateCapability,
     DuplicateBridgeCommand,
+    DuplicateCommand,
     DuplicatePlatform,
     DuplicateWindow,
     DuplicateView,
@@ -35,6 +36,8 @@ pub const max_shell_views_per_window: usize = 128;
 pub const max_view_label_bytes: usize = 96;
 pub const max_view_role_bytes: usize = 64;
 pub const max_command_id_bytes: usize = 128;
+pub const max_commands: usize = 256;
+pub const max_command_title_bytes: usize = 128;
 pub const max_menus: usize = 16;
 pub const max_menu_items: usize = 128;
 pub const max_menu_title_bytes: usize = 64;
@@ -348,6 +351,13 @@ pub const Shortcut = struct {
     modifiers: ShortcutModifiers = .{},
 };
 
+pub const Command = struct {
+    id: []const u8,
+    title: []const u8 = "",
+    enabled: bool = true,
+    checked: bool = false,
+};
+
 pub const Menu = struct {
     title: []const u8,
     items: []const MenuItem = &.{},
@@ -410,6 +420,7 @@ pub const Manifest = struct {
     platforms: []const PlatformSettings = &.{},
     windows: []const Window = &.{},
     shell: ShellConfig = .{},
+    commands: []const Command = &.{},
     menus: []const Menu = &.{},
     shortcuts: []const Shortcut = &.{},
     file_associations: []const FileAssociation = &.{},
@@ -431,6 +442,7 @@ pub fn validateManifest(manifest: Manifest) ValidationError!void {
     try validatePlatforms(manifest.platforms);
     try validateWindows(manifest.windows);
     try validateShell(manifest.shell, manifest.windows);
+    try validateCommands(manifest.commands);
     try validateMenus(manifest.menus);
     try validateShortcutsForPlatforms(manifest.shortcuts, manifest.platforms);
     try validateFileAssociations(manifest.file_associations);
@@ -532,6 +544,23 @@ pub fn validateShortcuts(shortcuts: []const Shortcut) ValidationError!void {
     return validateShortcutsForPlatforms(shortcuts, &.{});
 }
 
+pub fn validateCommands(commands: []const Command) ValidationError!void {
+    if (commands.len > max_commands) return error.InvalidCommand;
+    for (commands, 0..) |command, index| {
+        try validateCommandId(command.id);
+        if (command.title.len > max_command_title_bytes) return error.InvalidName;
+        try validateFreeText(command.title);
+        for (commands[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.id, command.id)) return error.DuplicateCommand;
+        }
+    }
+}
+
+fn validateCommandId(id: []const u8) ValidationError!void {
+    if (id.len == 0 or id.len > max_command_id_bytes) return error.InvalidCommand;
+    try validateName(id);
+}
+
 pub fn validateMenus(menus: []const Menu) ValidationError!void {
     if (menus.len > max_menus) return error.InvalidLayout;
     var item_count: usize = 0;
@@ -548,8 +577,7 @@ fn validateMenuItem(item: MenuItem) ValidationError!void {
     if (item.separator) return;
     if (item.label.len > max_menu_item_label_bytes) return error.InvalidName;
     try validateName(item.label);
-    if (item.command.len == 0 or item.command.len > max_command_id_bytes) return error.InvalidCommand;
-    try validateName(item.command);
+    try validateCommandId(item.command);
     if (item.key.len > 0) {
         if (item.key.len > max_menu_key_bytes) return error.InvalidShortcut;
         try validateShortcutKey(item.key);
@@ -1176,6 +1204,45 @@ test "manifest validates keyboard shortcuts" {
         .shortcuts = &.{.{ .id = long_id[0..], .key = "p" }},
     };
     try std.testing.expectError(error.InvalidShortcut, validateManifest(long_id_manifest));
+}
+
+test "manifest validates command metadata" {
+    const commands = [_]Command{
+        .{ .id = "app.refresh", .title = "Refresh" },
+        .{ .id = "app.sidebar.toggle", .title = "Sidebar", .checked = true },
+        .{ .id = "app.disabled", .enabled = false },
+    };
+
+    try validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .commands = &commands,
+    });
+
+    const duplicate_commands = [_]Command{
+        .{ .id = "app.refresh" },
+        .{ .id = "app.refresh" },
+    };
+    try std.testing.expectError(error.DuplicateCommand, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .commands = &duplicate_commands,
+    }));
+
+    const invalid_id_commands = [_]Command{.{ .id = "bad/name" }};
+    try std.testing.expectError(error.InvalidName, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .commands = &invalid_id_commands,
+    }));
+
+    const long_title = [_]u8{'x'} ** (max_command_title_bytes + 1);
+    const long_title_commands = [_]Command{.{ .id = "app.long-title", .title = long_title[0..] }};
+    try std.testing.expectError(error.InvalidName, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .commands = &long_title_commands,
+    }));
 }
 
 test "manifest validates native menus" {

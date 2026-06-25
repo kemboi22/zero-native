@@ -50,6 +50,17 @@ const view_items = [_]zero_native.MenuItem{
 
 The same command can be bound to a menu item, shortcut, toolbar button, tray item, and bridge call. The runtime validates command IDs and rejects empty, oversized, or path-like names.
 
+`app.zon` can also declare shared command metadata:
+
+```zig
+.commands = .{
+    .{ .id = "app.refresh", .title = "Refresh" },
+    .{ .id = "app.sidebar.toggle", .title = "Sidebar", .checked = true },
+},
+```
+
+This metadata gives native and web entry points a common manifest-level command catalog while runtime dispatch still happens through `Event.command`.
+
 ## Bridge invocation
 
 When `js_window_api` and the built-in bridge policy allow it, WebView content can dispatch the same command:

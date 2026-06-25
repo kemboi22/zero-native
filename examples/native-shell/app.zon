@@ -7,6 +7,10 @@
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "command", "view" },
     .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts" },
+    .commands = .{
+        .{ .id = "app.refresh", .title = "Refresh" },
+        .{ .id = "app.view.mode", .title = "View Mode" },
+    },
     .shortcuts = .{
         .{ .id = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
     },

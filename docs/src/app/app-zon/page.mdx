@@ -36,6 +36,10 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     .windows = .{
         .{ .label = "main", .title = "zero-native", .width = 720, .height = 480, .restore_state = true },
     },
+    .commands = .{
+        .{ .id = "command.palette", .title = "Command Palette" },
+        .{ .id = "app.reload", .title = "Reload" },
+    },
     .shortcuts = .{
         .{ .id = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
     },
@@ -130,6 +134,10 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
       <td>Native-first window and view tree declarations</td>
     </tr>
     <tr>
+      <td><code>commands</code></td>
+      <td>Shared command metadata for menus, shortcuts, native controls, tray items, and bridge calls</td>
+    </tr>
+    <tr>
       <td><code>shortcuts</code></td>
       <td>Keyboard shortcuts delivered as <code>shortcut</code> events (see <a href="/keyboard-shortcuts">Keyboard Shortcuts</a>)</td>
     </tr>
@@ -185,6 +193,22 @@ Supported `kind` values are `webview`, `toolbar`, `titlebar_accessory`, `sidebar
 Each view has a required `label` and `kind`. WebView views require `url`. Optional layout fields are `parent`, `edge`, `axis`, `x`, `y`, `width`, `height`, `min_width`, `min_height`, `max_width`, `max_height`, `fill`, and `layer`. Optional behavior and accessibility metadata are `visible`, `enabled`, `role`, `text`, and `command`. The `axis` field accepts `row` or `column` on parent containers such as `toolbar`, `sidebar`, `split`, and `stack`; it defaults to `row`.
 
 `createShellWindow` and `createShellViews` dock `edge` views against the remaining window content, let one or more top-level `fill` views use the final remaining rectangle, clamp resolved frames with any min/max size fields, and lay out parented controls such as toolbar buttons with small native defaults when explicit `x`, `y`, `width`, or `height` values are omitted. Parent containers flow omitted child positions horizontally with `axis = "row"` and vertically with `axis = "column"`. `split` containers use the same axis without inner spacing, so fixed-size children can sit beside a `fill` child. The runtime keeps the shell view slice as a layout binding and reapplies it when the window is resized, so pass data that lives for the lifetime of the window.
+
+## `commands`
+
+The optional `commands` list declares shared command metadata. The runtime still dispatches by command id, but this section gives menus, shortcuts, native controls, tray items, and bridge callers one manifest-level source of truth for user-facing labels and default state:
+
+```zig
+.commands = .{
+    .{ .id = "app.refresh", .title = "Refresh" },
+    .{ .id = "app.sidebar.toggle", .title = "Sidebar", .checked = true },
+    .{ .id = "app.sync", .title = "Sync", .enabled = false },
+},
+```
+
+`id` is required and must be unique. `title` defaults to an empty string. `enabled` defaults to `true`; `checked` defaults to `false`.
+
+An app can define up to 256 commands. Command ids can be up to 128 bytes and titles can be up to 128 bytes.
 
 ## `shortcuts`
 
