@@ -56,8 +56,10 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
 @property(nonatomic, assign) uint64_t windowId;
 @end
 
-@interface ZeroNativeWebView : WKWebView
+@interface ZeroNativeWebView : WKWebView <NSDraggingDestination>
 @property(nonatomic, strong) NSArray<NSValue *> *coveredMouseRects;
+@property(nonatomic, assign) ZeroNativeAppKitHost *host;
+@property(nonatomic, assign) uint64_t windowId;
 @end
 
 @interface ZeroNativeBridgeScriptHandler : NSObject <WKScriptMessageHandler>
@@ -159,6 +161,7 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
 - (void)runWithCallback:(zero_native_appkit_event_callback_t)callback context:(void *)context;
 - (void)stop;
 - (void)emitEvent:(zero_native_appkit_event_t)event;
+- (BOOL)emitDroppedFileURLs:(NSArray<NSURL *> *)urls windowId:(uint64_t)windowId;
 - (void)startApplicationActivationObservers;
 - (void)stopApplicationActivationObservers;
 - (void)applicationDidBecomeActive:(NSNotification *)notification;
@@ -260,6 +263,18 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
 - (void)mouseDragged:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseDragged:event]; }
 - (void)rightMouseDown:(NSEvent *)event { if (![self eventIsCovered:event]) [super rightMouseDown:event]; }
 - (void)rightMouseUp:(NSEvent *)event { if (![self eventIsCovered:event]) [super rightMouseUp:event]; }
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    return NSDragOperationCopy;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pasteboard = sender.draggingPasteboard;
+    NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[[NSURL class]]
+                                                       options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    return [self.host emitDroppedFileURLs:urls windowId:self.windowId];
+}
 
 @end
 
@@ -411,6 +426,9 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
     NSView *container = [[NSView alloc] initWithFrame:rect];
     container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     WKWebView *webView = [[ZeroNativeWebView alloc] initWithFrame:container.bounds configuration:configuration];
+    ((ZeroNativeWebView *)webView).host = self;
+    ((ZeroNativeWebView *)webView).windowId = windowId;
+    [webView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     webView.wantsLayer = YES;
     webView.layer.zPosition = 0;
     webView.layer.backgroundColor = NSColor.clearColor.CGColor;
@@ -771,6 +789,9 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
     }
 
     WKWebView *webview = [[ZeroNativeWebView alloc] initWithFrame:[self webViewFrameForWindow:window x:x y:y width:width height:height] configuration:configuration];
+    ((ZeroNativeWebView *)webview).host = self;
+    ((ZeroNativeWebView *)webview).windowId = windowId;
+    [webview registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     webview.wantsLayer = YES;
     webview.layer.zPosition = layer;
     if (transparent) {
@@ -1749,6 +1770,26 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
         .shortcut_key_len = [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
         .shortcut_modifiers = modifiers,
     }];
+}
+
+- (BOOL)emitDroppedFileURLs:(NSArray<NSURL *> *)urls windowId:(uint64_t)windowId {
+    if (urls.count == 0) return NO;
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *url in urls) {
+        if (!url.isFileURL || url.path.length == 0) continue;
+        [paths addObject:url.path];
+    }
+    if (paths.count == 0) return NO;
+    NSString *joined = [paths componentsJoinedByString:@"\n"];
+    NSData *data = [joined dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data || data.length == 0) return NO;
+    [self emitEvent:(zero_native_appkit_event_t){
+        .kind = ZERO_NATIVE_APPKIT_EVENT_FILES_DROPPED,
+        .window_id = windowId,
+        .drop_paths = data.bytes,
+        .drop_paths_len = data.length,
+    }];
+    return YES;
 }
 
 - (void)setShortcutsWithIds:(const char *const *)ids idLengths:(const size_t *)idLengths keys:(const char *const *)keys keyLengths:(const size_t *)keyLengths modifiers:(const uint32_t *)modifiers count:(size_t)count {

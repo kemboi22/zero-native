@@ -184,7 +184,7 @@ const NativeShellApp = struct {
                     try self.refresh(runtime, command.source);
                 }
             },
-            .shortcut, .lifecycle => {},
+            .shortcut, .files_dropped, .lifecycle => {},
         }
     }
 

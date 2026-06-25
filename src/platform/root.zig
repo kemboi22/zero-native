@@ -109,8 +109,9 @@ pub const max_clipboard_data_bytes: usize = 65536;
 pub const max_credential_service_bytes: usize = 128;
 pub const max_credential_account_bytes: usize = 256;
 pub const max_credential_secret_bytes: usize = 4096;
+pub const max_drop_paths_bytes: usize = 8192;
 pub const max_window_event_name_bytes: usize = 64;
-pub const max_window_event_detail_bytes: usize = 1024;
+pub const max_window_event_detail_bytes: usize = 8192;
 pub const max_views: usize = 32;
 pub const max_view_label_bytes: usize = 64;
 pub const max_view_role_bytes: usize = 64;
@@ -546,6 +547,11 @@ pub const MenuCommandEvent = struct {
     window_id: WindowId = 1,
 };
 
+pub const FileDropEvent = struct {
+    window_id: WindowId = 1,
+    paths: []const u8 = "",
+};
+
 pub const ClipboardData = struct {
     mime_type: []const u8 = "text/plain",
     bytes: []const u8,
@@ -565,6 +571,7 @@ pub const Event = union(enum) {
     shortcut: ShortcutEvent,
     native_command: NativeCommandEvent,
     menu_command: MenuCommandEvent,
+    files_dropped: FileDropEvent,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
@@ -581,6 +588,7 @@ pub const Event = union(enum) {
             .shortcut => "shortcut",
             .native_command => "native_command",
             .menu_command => "menu_command",
+            .files_dropped => "files_dropped",
         };
     }
 };

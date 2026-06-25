@@ -51,6 +51,13 @@ zero-native capabilities are native OS services and app events exposed through `
       <td><code>text/plain</code> on desktop hosts; <code>text/html</code> and RTF on macOS system WebView and macOS Chromium</td>
     </tr>
     <tr>
+      <td>File drops</td>
+      <td><code>Event.files_dropped</code></td>
+      <td><code>window.zero.on("drop:files")</code></td>
+      <td>None. Host-emitted event.</td>
+      <td>macOS system WebView</td>
+    </tr>
+    <tr>
       <td>Credential store</td>
       <td><code>runtime.setCredential(options)</code> / <code>runtime.getCredential(key)</code> / <code>runtime.deleteCredential(key)</code></td>
       <td><code>zero-native.credentials.set</code> / <code>zero-native.credentials.get</code> / <code>zero-native.credentials.delete</code></td>
@@ -133,6 +140,10 @@ await window.zero.clipboard.write({
   data: "<strong>Copied from zero-native</strong>",
 });
 const html = await window.zero.clipboard.read({ mimeType: "text/html" });
+
+window.zero.on("drop:files", (event) => {
+  console.log(event.paths);
+});
 
 await window.zero.credentials.set({
   service: "com.example.app",

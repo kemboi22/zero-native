@@ -266,6 +266,11 @@ export interface ZeroNativeShortcutDetail {
 
 export type ZeroNativeAppLifecycleDetail = Record<string, never>;
 
+export interface ZeroNativeFileDropDetail {
+  windowId: number;
+  paths: string[];
+}
+
 export interface ZeroNativeOpenFileOptions {
   title?: string;
   defaultPath?: string;
@@ -334,9 +339,11 @@ export interface ZeroNativeApi {
   invoke<T = ZeroNativeJson>(command: string, payload?: ZeroNativeJson): Promise<T>;
   on(name: "shortcut", callback: (detail: ZeroNativeShortcutDetail) => void): () => void;
   on(name: "app:activate" | "app:deactivate", callback: (detail: ZeroNativeAppLifecycleDetail) => void): () => void;
+  on(name: "drop:files", callback: (detail: ZeroNativeFileDropDetail) => void): () => void;
   on<T = ZeroNativeJson>(name: string, callback: (detail: T) => void): () => void;
   off(name: "shortcut", callback: (detail: ZeroNativeShortcutDetail) => void): void;
   off(name: "app:activate" | "app:deactivate", callback: (detail: ZeroNativeAppLifecycleDetail) => void): void;
+  off(name: "drop:files", callback: (detail: ZeroNativeFileDropDetail) => void): void;
   off<T = ZeroNativeJson>(name: string, callback: (detail: T) => void): void;
   /** Dispatch an app command through the runtime command path. */
   commands: {

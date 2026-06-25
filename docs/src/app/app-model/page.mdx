@@ -122,6 +122,14 @@ window.zero.on("app:activate", () => {
 });
 ```
 
+Native file drops dispatch `Event.files_dropped` to `event_fn` and emit `drop:files` to trusted `window.zero` instances:
+
+```ts
+window.zero.on("drop:files", (event) => {
+  console.log(event.paths);
+});
+```
+
 ## The runner pattern
 
 The generated `src/runner.zig` wires the runtime with platform services:
@@ -219,7 +227,7 @@ try runtime.run(my_app.app());
       <td><code>js_window_api</code></td>
       <td><code>bool</code></td>
       <td><code>false</code></td>
-      <td>Expose built-in <code>window.zero</code> helper namespaces for trusted app chrome. Window, view, and WebView helpers require origin and <code>window</code> checks; dialog and OS helpers still require explicit <code>builtin_bridge</code> policy.</td>
+      <td>Expose built-in <code>window.zero</code> helper namespaces for trusted app chrome. Window, view, and WebView helpers require origin and <code>window</code> checks; dialog, OS, clipboard, and credential helpers still require explicit <code>builtin_bridge</code> policy.</td>
     </tr>
   </tbody>
 </table>
