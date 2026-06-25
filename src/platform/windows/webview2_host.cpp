@@ -57,6 +57,7 @@ constexpr size_t kMaxShortcuts = 64;
 constexpr uint32_t kMenuCommandBase = 0x4000;
 constexpr uint32_t kTrayCommandBase = 0x5000;
 constexpr UINT kNotificationCallbackMessage = WM_APP + 42;
+constexpr const char *kAssetVirtualOrigin = "https://zero-native-app.localhost";
 
 constexpr int kViewWebView = 0;
 constexpr int kViewToolbar = 1;
@@ -172,6 +173,7 @@ struct ChildWebView {
     std::string asset_root;
     std::string asset_entry;
     std::string asset_origin;
+    bool spa_fallback = false;
     double x = 0;
     double y = 0;
     double width = 0;
@@ -512,34 +514,172 @@ static std::string trimLeadingPathSeparators(std::string value) {
     return value;
 }
 
-static std::string fileUrlFromPath(std::string path) {
-    if (path.empty()) return std::string();
-    std::replace(path.begin(), path.end(), '\\', '/');
-    std::string out = "file:///";
-    constexpr char hex[] = "0123456789ABCDEF";
-    for (unsigned char ch : path) {
-        if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '/' || ch == ':') {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(ch >> 4) & 0x0f]);
-            out.push_back(hex[ch & 0x0f]);
-        }
-    }
-    return out;
+static std::string assetOrigin(const ChildWebView &webview) {
+    return webview.asset_origin.empty() ? std::string("zero://app") : webview.asset_origin;
 }
 
-static std::string assetEntryUrl(const std::string &root, const std::string &entry, const std::string &origin) {
-    std::string clean_entry = trimLeadingPathSeparators(entry.empty() ? std::string("index.html") : entry);
-    if (!root.empty()) {
-        std::string path = root;
-        if (!path.empty() && path.back() != '/' && path.back() != '\\') path.push_back('\\');
-        path += clean_entry;
-        return fileUrlFromPath(path);
+static bool isHexDigit(char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+}
+
+static unsigned char hexByte(char high, char low) {
+    auto nibble = [](char ch) -> unsigned char {
+        if (ch >= '0' && ch <= '9') return static_cast<unsigned char>(ch - '0');
+        if (ch >= 'a' && ch <= 'f') return static_cast<unsigned char>(ch - 'a' + 10);
+        return static_cast<unsigned char>(ch - 'A' + 10);
+    };
+    return static_cast<unsigned char>((nibble(high) << 4) | nibble(low));
+}
+
+static bool urlDecodePath(const std::string &value, std::string *out) {
+    if (!out) return false;
+    out->clear();
+    for (size_t index = 0; index < value.size(); ++index) {
+        char ch = value[index];
+        if (ch == '%') {
+            if (index + 2 >= value.size() || !isHexDigit(value[index + 1]) || !isHexDigit(value[index + 2])) return false;
+            out->push_back(static_cast<char>(hexByte(value[index + 1], value[index + 2])));
+            index += 2;
+        } else {
+            out->push_back(ch);
+        }
     }
+    return true;
+}
+
+static bool safeAssetRelativePath(const std::string &value) {
+    if (value.empty()) return false;
+    size_t start = 0;
+    while (start <= value.size()) {
+        size_t end = value.find('/', start);
+        if (end == std::string::npos) end = value.size();
+        std::string segment = value.substr(start, end - start);
+        if (!segment.empty()) {
+            if (segment == "." || segment == "..") return false;
+            for (unsigned char ch : segment) {
+                if (ch < 0x20 || ch == 0x7f || ch == '\\' || ch == ':') return false;
+            }
+        }
+        if (end == value.size()) break;
+        start = end + 1;
+    }
+    return true;
+}
+
+static std::string safeAssetEntryPath(const std::string &entry) {
+    std::string clean_entry = trimLeadingPathSeparators(entry.empty() ? std::string("index.html") : entry);
+    return safeAssetRelativePath(clean_entry) ? clean_entry : std::string("index.html");
+}
+
+static bool assetRelativePathFromUrl(const std::string &url, const std::string &entry, std::string *out) {
+    if (!out) return false;
+    std::string raw;
+    size_t scheme_end = url.find("://");
+    size_t path_start = scheme_end == std::string::npos ? std::string::npos : url.find('/', scheme_end + 3);
+    if (path_start == std::string::npos) {
+        raw = entry.empty() ? std::string("index.html") : entry;
+    } else {
+        size_t path_end = url.find_first_of("?#", path_start);
+        raw = url.substr(path_start + 1, path_end == std::string::npos ? std::string::npos : path_end - path_start - 1);
+    }
+
+    std::string decoded;
+    if (!urlDecodePath(raw, &decoded)) return false;
+    decoded = trimLeadingPathSeparators(decoded);
+    if (decoded.empty()) decoded = entry.empty() ? std::string("index.html") : trimLeadingPathSeparators(entry);
+    if (!safeAssetRelativePath(decoded)) return false;
+    *out = decoded;
+    return true;
+}
+
+static std::string originAssetEntryUrl(const std::string &entry, const std::string &origin) {
+    std::string clean_entry = safeAssetEntryPath(entry);
     std::string base = origin.empty() ? std::string("zero://app") : origin;
     if (!base.empty() && base.back() != '/') base.push_back('/');
     return base + clean_entry;
+}
+
+static std::string virtualAssetEntryUrl(const std::string &entry) {
+    return originAssetEntryUrl(entry, kAssetVirtualOrigin);
+}
+
+static std::string assetEntryUrl(const ChildWebView &webview) {
+    return virtualAssetEntryUrl(webview.asset_entry);
+}
+
+static bool isInternalAssetUrl(const ChildWebView &webview, const std::string &url) {
+    if (webview.source_kind != 2) return false;
+    const std::string origin = originForUrl(url);
+    if (!webview.asset_root.empty() && origin == kAssetVirtualOrigin) return true;
+    return origin == assetOrigin(webview);
+}
+
+static std::string bridgeOriginForWebViewUrl(const ChildWebView &webview, const std::string &url) {
+    return isInternalAssetUrl(webview, url) ? assetOrigin(webview) : originForUrl(url);
+}
+
+static std::wstring assetFilePath(const ChildWebView &webview, const std::string &relative) {
+    std::string path = webview.asset_root.empty() ? std::string(".") : webview.asset_root;
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') path.push_back('\\');
+    std::string native_relative = relative;
+    std::replace(native_relative.begin(), native_relative.end(), '/', '\\');
+    path += native_relative;
+    return widen(path);
+}
+
+static bool regularFileExists(const std::wstring &path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool readFileBytes(const std::wstring &path, std::string *out) {
+    if (!out) return false;
+    out->clear();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        CloseHandle(file);
+        return false;
+    }
+    if (size.QuadPart == 0) {
+        CloseHandle(file);
+        return true;
+    }
+    out->resize(static_cast<size_t>(size.QuadPart));
+    size_t offset = 0;
+    while (offset < out->size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(out->size() - offset, 64 * 1024));
+        DWORD read = 0;
+        if (!ReadFile(file, &(*out)[offset], chunk, &read, nullptr) || read == 0) {
+            CloseHandle(file);
+            return false;
+        }
+        offset += read;
+    }
+    CloseHandle(file);
+    return true;
+}
+
+static std::string mimeTypeForPath(const std::string &path) {
+    size_t dot = path.find_last_of('.');
+    std::string ext = dot == std::string::npos ? std::string() : path.substr(dot + 1);
+    for (char &ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (ext == "html" || ext == "htm") return "text/html";
+    if (ext == "js" || ext == "mjs") return "text/javascript";
+    if (ext == "css") return "text/css";
+    if (ext == "json") return "application/json";
+    if (ext == "svg") return "image/svg+xml";
+    if (ext == "png") return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "gif") return "image/gif";
+    if (ext == "webp") return "image/webp";
+    if (ext == "woff") return "font/woff";
+    if (ext == "woff2") return "font/woff2";
+    if (ext == "ttf") return "font/ttf";
+    if (ext == "otf") return "font/otf";
+    if (ext == "wasm") return "application/wasm";
+    return "application/octet-stream";
 }
 
 static bool policyListMatches(const std::vector<std::string> &values, const std::string &url) {
@@ -1351,6 +1491,70 @@ static void applyWebViewFrame(ChildWebView &webview) {
     }
 }
 
+static ComPtr<IStream> streamFromBytes(const std::string &bytes) {
+    ComPtr<IStream> stream;
+    if (bytes.empty()) {
+        IStream *raw_stream = nullptr;
+        if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &raw_stream))) stream.Attach(raw_stream);
+        return stream;
+    }
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+    if (!memory) return stream;
+    void *ptr = GlobalLock(memory);
+    if (!ptr) {
+        GlobalFree(memory);
+        return stream;
+    }
+    memcpy(ptr, bytes.data(), bytes.size());
+    GlobalUnlock(memory);
+
+    IStream *raw_stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(memory, TRUE, &raw_stream))) {
+        GlobalFree(memory);
+        return stream;
+    }
+    stream.Attach(raw_stream);
+    return stream;
+}
+
+static ComPtr<ICoreWebView2WebResourceResponse> webResourceResponse(ICoreWebView2Environment *environment, int status, const wchar_t *reason, const std::string &mime_type, const std::string &bytes) {
+    ComPtr<ICoreWebView2WebResourceResponse> response;
+    if (!environment) return response;
+    ComPtr<IStream> stream = streamFromBytes(bytes);
+    if (!stream) return response;
+    std::wstring headers = L"Content-Type: " + widen(mime_type) + L"\r\n";
+    environment->CreateWebResourceResponse(stream.Get(), status, reason, headers.c_str(), &response);
+    return response;
+}
+
+static ComPtr<ICoreWebView2WebResourceResponse> textWebResourceResponse(ICoreWebView2Environment *environment, int status, const wchar_t *reason, const char *message) {
+    return webResourceResponse(environment, status, reason, "text/plain", message ? std::string(message) : std::string());
+}
+
+static ComPtr<ICoreWebView2WebResourceResponse> assetWebResourceResponse(ICoreWebView2Environment *environment, const ChildWebView &webview, const std::string &uri) {
+    if (!isInternalAssetUrl(webview, uri)) return {};
+
+    std::string relative;
+    if (!assetRelativePathFromUrl(uri, webview.asset_entry, &relative)) {
+        return textWebResourceResponse(environment, 400, L"Bad Request", "Unsafe asset path");
+    }
+
+    std::string served_relative = relative;
+    std::wstring path = assetFilePath(webview, served_relative);
+    if (!regularFileExists(path) && webview.spa_fallback) {
+        served_relative = safeAssetEntryPath(webview.asset_entry);
+        path = assetFilePath(webview, served_relative);
+    }
+
+    std::string bytes;
+    if (!readFileBytes(path, &bytes)) {
+        return textWebResourceResponse(environment, 404, L"Not Found", "Asset not found");
+    }
+
+    return webResourceResponse(environment, 200, L"OK", mimeTypeForPath(served_relative), bytes);
+}
+
 static void loadWebViewSource(ChildWebView &webview) {
     if (!webview.webview) return;
     if (webview.source_kind == 0) {
@@ -1359,7 +1563,7 @@ static void loadWebViewSource(ChildWebView &webview) {
         return;
     }
     std::string target = webview.source_kind == 2
-        ? assetEntryUrl(webview.asset_root, webview.asset_entry, webview.asset_origin)
+        ? assetEntryUrl(webview)
         : webview.url;
     if (target.empty()) target = "about:blank";
     std::wstring wide_target = widen(target);
@@ -1400,8 +1604,9 @@ static bool createChildWebView(Host *host, const std::string &key) {
                 cleanupPendingChildWebView(host, key);
                 return result;
             }
+            ComPtr<ICoreWebView2Environment> environment_ref = environment;
             return environment->CreateCoreWebView2Controller(parent, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                [host, key, lifetime](HRESULT controller_result, ICoreWebView2Controller *controller) -> HRESULT {
+                [host, key, lifetime, environment_ref](HRESULT controller_result, ICoreWebView2Controller *controller) -> HRESULT {
                     auto token = lifetime.lock();
                     if (!token) {
                         if (controller) controller->Close();
@@ -1451,7 +1656,11 @@ static bool createChildWebView(Host *host, const std::string &key) {
                                     if (SUCCEEDED(args->get_Source(&source_bytes)) && source_bytes) {
                                         std::wstring source_wide(source_bytes);
                                         CoTaskMemFree(source_bytes);
-                                        origin = originForUrl(narrow(source_wide));
+                                        std::string source_url = narrow(source_wide);
+                                        auto source_webview = host->webviews.find(key);
+                                        origin = source_webview == host->webviews.end()
+                                            ? originForUrl(source_url)
+                                            : bridgeOriginForWebViewUrl(source_webview->second, source_url);
                                     }
 
                                     host->bridge_callback(
@@ -1485,9 +1694,32 @@ static bool createChildWebView(Host *host, const std::string &key) {
                                 return S_OK;
                             }).Get(), &accelerator_token);
 
+                        found->second.webview->AddWebResourceRequestedFilter(L"https://zero-native-app.localhost/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                        EventRegistrationToken asset_token = {};
+                        found->second.webview->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                            [host, key, environment_ref, lifetime](ICoreWebView2 *, ICoreWebView2WebResourceRequestedEventArgs *args) -> HRESULT {
+                                auto token = lifetime.lock();
+                                if (!token) return S_OK;
+                                std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                if (!token->alive || !args) return S_OK;
+                                auto found = host->webviews.find(key);
+                                if (found == host->webviews.end()) return S_OK;
+                                ComPtr<ICoreWebView2WebResourceRequest> request;
+                                if (FAILED(args->get_Request(&request)) || !request) return S_OK;
+                                LPWSTR uri_bytes = nullptr;
+                                if (FAILED(request->get_Uri(&uri_bytes)) || !uri_bytes) return S_OK;
+                                std::wstring uri_wide(uri_bytes);
+                                CoTaskMemFree(uri_bytes);
+                                std::string uri = narrow(uri_wide);
+                                if (!isInternalAssetUrl(found->second, uri)) return S_OK;
+                                ComPtr<ICoreWebView2WebResourceResponse> response = assetWebResourceResponse(environment_ref.Get(), found->second, uri);
+                                if (response) args->put_Response(response.Get());
+                                return S_OK;
+                            }).Get(), &asset_token);
+
                         EventRegistrationToken token = {};
                         found->second.webview->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
-                            [host, lifetime](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
+                            [host, key, lifetime](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
                                 auto token = lifetime.lock();
                                 if (!token) return S_OK;
                                 std::lock_guard<std::recursive_mutex> guard(token->mutex);
@@ -1497,6 +1729,8 @@ static bool createChildWebView(Host *host, const std::string &key) {
                                 std::wstring uri_wide = uri_bytes ? std::wstring(uri_bytes) : std::wstring();
                                 if (uri_bytes) CoTaskMemFree(uri_bytes);
                                 std::string uri = narrow(uri_wide);
+                                auto found = host->webviews.find(key);
+                                if (found != host->webviews.end() && isInternalAssetUrl(found->second, uri)) return S_OK;
                                 if (uri.empty() || uri.rfind("about:", 0) == 0 || policyListMatches(host->allowed_origins, uri)) return S_OK;
                                 if (host->external_link_action == 1 && policyListMatches(host->allowed_external_urls, uri)) {
                                     ShellExecuteW(nullptr, L"open", uri_wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1759,8 +1993,8 @@ void zero_native_windows_load_webview(Host *host, const char *source, size_t sou
 }
 
 void zero_native_windows_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
-    (void)spa_fallback;
 #if !ZERO_NATIVE_HAS_WEBVIEW2
+    (void)spa_fallback;
     (void)source;
     (void)source_len;
     (void)source_kind;
@@ -1814,6 +2048,7 @@ void zero_native_windows_load_window_webview(Host *host, uint64_t window_id, con
         webview.asset_root = slice(asset_root, asset_root_len);
         webview.asset_entry = slice(asset_entry, asset_entry_len);
         webview.asset_origin = slice(asset_origin, asset_origin_len);
+        webview.spa_fallback = spa_fallback != 0;
         host->webviews[key] = webview;
         found = host->webviews.find(key);
         if (!createChildWebView(host, key)) {
@@ -1830,6 +2065,7 @@ void zero_native_windows_load_window_webview(Host *host, uint64_t window_id, con
     webview.asset_root = slice(asset_root, asset_root_len);
     webview.asset_entry = slice(asset_entry, asset_entry_len);
     webview.asset_origin = slice(asset_origin, asset_origin_len);
+    webview.spa_fallback = spa_fallback != 0;
     loadWebViewSource(webview);
     emit(host, window->second, kWindowFrame);
 #endif
