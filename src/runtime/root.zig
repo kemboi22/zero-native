@@ -983,6 +983,27 @@ pub const Runtime = struct {
             .bridge => {
                 try self.handleBridgeMessage(app, .{ .bytes = command.value, .origin = "zero://inline", .window_id = 1, .webview_label = "main" });
             },
+            .native_command => {
+                const parsed = try parseAutomationNativeCommand(command.value);
+                try self.dispatchPlatformEvent(app, .{ .native_command = .{
+                    .name = parsed.name,
+                    .window_id = 1,
+                    .view_label = parsed.view_label,
+                } });
+            },
+            .menu_command => {
+                try self.dispatchPlatformEvent(app, .{ .menu_command = .{
+                    .name = try parseAutomationCommandName(command.value),
+                    .window_id = 1,
+                } });
+            },
+            .shortcut => {
+                try self.dispatchPlatformEvent(app, .{ .shortcut = .{
+                    .id = try parseAutomationCommandName(command.value),
+                    .key = "",
+                    .window_id = 1,
+                } });
+            },
             .wait => {},
         }
     }
@@ -3045,6 +3066,29 @@ fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
 
 fn jsonStringField(payload: []const u8, field: []const u8, storage: *json.StringStorage) ?[]const u8 {
     return json.stringField(payload, field, storage);
+}
+
+const AutomationNativeCommand = struct {
+    name: []const u8,
+    view_label: []const u8 = "",
+};
+
+fn parseAutomationCommandName(value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \n\r\t");
+    if (trimmed.len == 0) return error.InvalidCommand;
+    const separator = std.mem.indexOfAny(u8, trimmed, " \n\r\t") orelse return trimmed;
+    return trimmed[0..separator];
+}
+
+fn parseAutomationNativeCommand(value: []const u8) !AutomationNativeCommand {
+    const trimmed = std.mem.trim(u8, value, " \n\r\t");
+    if (trimmed.len == 0) return error.InvalidCommand;
+    const separator = std.mem.indexOfAny(u8, trimmed, " \n\r\t") orelse return .{ .name = trimmed };
+    const view_label = std.mem.trim(u8, trimmed[separator + 1 ..], " \n\r\t");
+    return .{
+        .name = trimmed[0..separator],
+        .view_label = view_label,
+    };
 }
 
 fn validateCommandName(name: []const u8) !void {

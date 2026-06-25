@@ -85,6 +85,18 @@ The runtime polls `command.txt` and processes these actions:
       <td><code>bridge &lt;json&gt;</code></td>
       <td>Send a bridge command with origin <code>zero://inline</code></td>
     </tr>
+    <tr>
+      <td><code>menu-command &lt;id&gt;</code></td>
+      <td>Dispatch a menu command event for the main window</td>
+    </tr>
+    <tr>
+      <td><code>native-command &lt;id&gt; [&lt;view-label&gt;]</code></td>
+      <td>Dispatch a native view command event for the main window</td>
+    </tr>
+    <tr>
+      <td><code>shortcut &lt;id&gt;</code></td>
+      <td>Dispatch a shortcut command event for the main window</td>
+    </tr>
   </tbody>
 </table>
 
@@ -116,13 +128,13 @@ zero-native automate bridge '{"id":"1","command":"native.ping","payload":{"sourc
 
 ## Testing with automation
 
-The `test-webview-smoke` build step demonstrates a full automation test flow:
+The WebView and native-shell smoke build steps demonstrate full automation test flows:
 
 1. Build and start the app with `-Dautomation=true`
 2. Run `zero-native automate wait` to block until the app is ready
 3. Run `zero-native automate snapshot` to verify window, source, and native/WebView metadata
-4. Run `zero-native automate bridge '...'` to test the native bridge round-trip
-5. Verify the response in `bridge-response.txt`
+4. Run `zero-native automate bridge '...'` or write command-source actions to `command.txt`
+5. Verify bridge responses and updated snapshots
 
 ```bash
 zig build test-webview-smoke -Dplatform=macos

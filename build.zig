@@ -342,6 +342,33 @@ pub fn build(b: *std.Build) void {
         \\  sleep 0.1
         \\done
         \\case "$snapshot" in *'view @w1/status-label kind=label'*'Refreshed from bridge. Count 1.'*) ;; *) echo "native-shell status view did not reflect bridge refresh" >&2; exit 1 ;; esac
+        \\printf 'menu-command app.refresh\n' > "$automation_dir/command.txt"
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'Refreshed from menu. Count 2.'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/status-label kind=label'*'Refreshed from menu. Count 2.'*) ;; *) echo "native-shell menu command did not update status" >&2; exit 1 ;; esac
+        \\printf 'native-command app.refresh refresh-button\n' > "$automation_dir/command.txt"
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'Refreshed from toolbar. Count 3.'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/status-label kind=label'*'Refreshed from toolbar. Count 3.'*) ;; *) echo "native-shell toolbar command did not update status" >&2; exit 1 ;; esac
+        \\printf 'shortcut app.refresh\n' > "$automation_dir/command.txt"
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'Refreshed from shortcut. Count 4.'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/status-label kind=label'*'Refreshed from shortcut. Count 4.'*) ;; *) echo "native-shell shortcut command did not update status" >&2; exit 1 ;; esac
         \\echo "native-shell smoke ok"
         ,
         "sh",
