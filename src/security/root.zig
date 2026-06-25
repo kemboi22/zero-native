@@ -4,6 +4,8 @@ pub const permission_window = "window";
 pub const permission_filesystem = "filesystem";
 pub const permission_clipboard = "clipboard";
 pub const permission_network = "network";
+pub const permission_notifications = "notifications";
+pub const permission_credentials = "credentials";
 
 pub const ExternalLinkAction = enum(c_int) {
     deny = 0,
@@ -47,6 +49,19 @@ pub fn allowsOrigin(allowed_origins: []const []const u8, origin: []const u8) boo
     return false;
 }
 
+pub fn allowsExternalUrl(policy: ExternalLinkPolicy, url: []const u8) bool {
+    if (policy.action != .open_system_browser) return false;
+    for (policy.allowed_urls) |allowed| {
+        if (std.mem.eql(u8, allowed, "*")) return true;
+        if (std.mem.eql(u8, allowed, url)) return true;
+        if (std.mem.endsWith(u8, allowed, "*")) {
+            const prefix = allowed[0 .. allowed.len - 1];
+            if (std.mem.startsWith(u8, url, prefix)) return true;
+        }
+    }
+    return false;
+}
+
 test "permission checks require every requested grant" {
     try std.testing.expect(hasPermissions(&.{ permission_window, permission_filesystem }, &.{permission_window}));
     try std.testing.expect(!hasPermissions(&.{permission_window}, &.{ permission_window, permission_filesystem }));
@@ -56,4 +71,23 @@ test "origin checks support exact origins and wildcard" {
     try std.testing.expect(allowsOrigin(&.{ "zero://app", "zero://inline" }, "zero://inline"));
     try std.testing.expect(allowsOrigin(&.{"*"}, "https://example.invalid"));
     try std.testing.expect(!allowsOrigin(&.{"zero://app"}, "https://example.invalid"));
+}
+
+test "external URL checks require open-browser action and allowed URL pattern" {
+    try std.testing.expect(!allowsExternalUrl(.{
+        .action = .deny,
+        .allowed_urls = &.{"https://example.com/*"},
+    }, "https://example.com/docs"));
+    try std.testing.expect(allowsExternalUrl(.{
+        .action = .open_system_browser,
+        .allowed_urls = &.{"https://example.com/*"},
+    }, "https://example.com/docs"));
+    try std.testing.expect(allowsExternalUrl(.{
+        .action = .open_system_browser,
+        .allowed_urls = &.{"https://example.com/docs"},
+    }, "https://example.com/docs"));
+    try std.testing.expect(!allowsExternalUrl(.{
+        .action = .open_system_browser,
+        .allowed_urls = &.{"https://example.com/*"},
+    }, "https://other.example/docs"));
 }

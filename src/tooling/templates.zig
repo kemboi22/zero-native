@@ -397,6 +397,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        app_mod.linkFramework("AppKit", .{});
         \\        app_mod.linkFramework("Foundation", .{});
         \\        app_mod.linkFramework("UniformTypeIdentifiers", .{});
+        \\        app_mod.linkFramework("Security", .{});
         \\        app_mod.linkSystemLibrary("c", .{});
         \\        if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
         \\    } else if (platform == .linux) {

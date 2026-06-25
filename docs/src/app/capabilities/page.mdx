@@ -1,0 +1,137 @@
+# Capabilities
+
+zero-native capabilities are native OS services and app events exposed through `PlatformServices`, runtime methods, lifecycle events, and guarded bridge commands. Web content does not receive capability access by default.
+
+## Current capability pack
+
+<table>
+  <thead>
+    <tr>
+      <th>Capability</th>
+      <th>Zig API</th>
+      <th>JavaScript command</th>
+      <th>Bridge permission</th>
+      <th>Current native support</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Open URL in system browser</td>
+      <td><code>runtime.openExternalUrl(url)</code></td>
+      <td><code>zero-native.os.openUrl</code></td>
+      <td><code>network</code></td>
+      <td>macOS system WebView and macOS Chromium</td>
+    </tr>
+    <tr>
+      <td>System notification</td>
+      <td><code>runtime.showNotification(options)</code></td>
+      <td><code>zero-native.os.showNotification</code></td>
+      <td><code>notifications</code></td>
+      <td>macOS system WebView and macOS Chromium</td>
+    </tr>
+    <tr>
+      <td>Reveal path in file manager</td>
+      <td><code>runtime.revealPath(path)</code></td>
+      <td><code>zero-native.os.revealPath</code></td>
+      <td><code>filesystem</code></td>
+      <td>macOS system WebView and macOS Chromium</td>
+    </tr>
+    <tr>
+      <td>Recent documents</td>
+      <td><code>runtime.addRecentDocument(path)</code> / <code>runtime.clearRecentDocuments()</code></td>
+      <td><code>zero-native.os.addRecentDocument</code> / <code>zero-native.os.clearRecentDocuments</code></td>
+      <td><code>filesystem</code></td>
+      <td>macOS system WebView and macOS Chromium</td>
+    </tr>
+    <tr>
+      <td>Credential store</td>
+      <td><code>runtime.setCredential(options)</code> / <code>runtime.getCredential(key)</code> / <code>runtime.deleteCredential(key)</code></td>
+      <td><code>zero-native.credentials.set</code> / <code>zero-native.credentials.get</code> / <code>zero-native.credentials.delete</code></td>
+      <td><code>credentials</code></td>
+      <td>macOS system WebView and macOS Chromium through Keychain</td>
+    </tr>
+    <tr>
+      <td>App activation events</td>
+      <td><code>LifecycleEvent.activate</code> / <code>LifecycleEvent.deactivate</code></td>
+      <td><code>window.zero.on("app:activate")</code> / <code>window.zero.on("app:deactivate")</code></td>
+      <td>None. Host-emitted event.</td>
+      <td>macOS system WebView and macOS Chromium</td>
+    </tr>
+    <tr>
+      <td>File associations and URL schemes</td>
+      <td><code>Manifest.file_associations</code> / <code>Manifest.url_schemes</code></td>
+      <td>None. Packaging metadata.</td>
+      <td>None. Manifest-only declaration.</td>
+      <td>Parsed and validated. Native package registration is explicitly unsupported until packagers emit platform metadata.</td>
+    </tr>
+  </tbody>
+</table>
+
+Unsupported platform hosts reject with the standard unsupported-service error.
+
+## Security
+
+OS bridge commands are default-deny. Add explicit `builtin_bridge` entries for each command your app calls:
+
+```zig
+.builtin_bridge = .{
+    .enabled = true,
+    .commands = &.{
+        .{ .name = "zero-native.os.openUrl", .permissions = .{ "network" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.os.showNotification", .permissions = .{ "notifications" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.os.revealPath", .permissions = .{ "filesystem" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.os.addRecentDocument", .permissions = .{ "filesystem" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.os.clearRecentDocuments", .permissions = .{ "filesystem" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.credentials.set", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.credentials.get", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
+        .{ .name = "zero-native.credentials.delete", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
+    },
+},
+```
+
+Opening external URLs is also gated by the external-link policy:
+
+```zig
+.security = .{
+    .navigation = .{
+        .external_links = .{
+            .action = .open_system_browser,
+            .allowed_urls = &.{ "https://example.com/docs/*" },
+        },
+    },
+},
+```
+
+## JavaScript
+
+```javascript
+await window.zero.os.openUrl("https://example.com/docs/start");
+await window.zero.os.showNotification({
+  title: "Build finished",
+  subtitle: "zero-native",
+  body: "All checks passed.",
+});
+await window.zero.os.revealPath("/Users/me/Downloads/report.pdf");
+await window.zero.os.addRecentDocument("/Users/me/Downloads/report.pdf");
+await window.zero.os.clearRecentDocuments();
+
+await window.zero.credentials.set({
+  service: "com.example.app",
+  account: "current-user",
+  secret: "session-token",
+});
+const token = await window.zero.credentials.get({
+  service: "com.example.app",
+  account: "current-user",
+});
+await window.zero.credentials.delete({
+  service: "com.example.app",
+  account: "current-user",
+});
+
+window.zero.on("app:activate", () => {
+  refreshForegroundState();
+});
+```
+
+See also: [Builtin Commands](/bridge/builtin-commands) and [Security](/security).

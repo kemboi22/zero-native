@@ -2,6 +2,7 @@
 
 #import <AppKit/AppKit.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <Security/Security.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <crt_externs.h>
 #include <stdio.h>
@@ -53,6 +54,19 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event);
 static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event);
 static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift);
+
+static NSString *ZeroNativeStringFromBytes(const char *bytes, size_t len) {
+    if (!bytes || len == 0) return nil;
+    return [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
+}
+
+static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSString *account) {
+    return [@{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: service,
+        (__bridge id)kSecAttrAccount: account,
+    } mutableCopy];
+}
 
 class ZeroNativeCefBridgeV8Handler final : public CefV8Handler {
 public:
@@ -313,15 +327,26 @@ static const char *ZeroNativeCefBridgeScript() {
         "function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}"
         "function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}"
         "function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}"
+        "function commandPayload(value){if(typeof value==='string'){return {name:ensureString(value,'command')};}value=value||{};var name=value.name!=null?value.name:value.id;return {name:ensureString(name,'command')};}"
         "function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}"
         "function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}"
         "function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}"
         "function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}"
         "function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}"
         "function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}"
+        "function validateViewSelector(options){options=options||{};ensureString(options.label,'label');if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}"
+        "function optionalFramePayload(options){var frame=options.frame||((options.x!=null||options.y!=null||options.width!=null||options.height!=null)?options:null);if(!frame){return null;}return {x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')};}"
+        "function viewCreatePayload(options){options=options||{};validateViewSelector(options);ensureString(options.kind,'kind');var payload={label:options.label,kind:options.kind,windowId:options.windowId};var frame=optionalFramePayload(options);if(frame){payload.frame=frame;}if(options.parent!=null){payload.parent=ensureString(options.parent,'parent');}if(options.role!=null){payload.role=ensureString(options.role,'role');}if(options.url!=null){payload.url=ensureString(options.url,'url');}if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.visible!=null){payload.visible=!!options.visible;}if(options.enabled!=null){payload.enabled=!!options.enabled;}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}"
+        "function viewPatchPayload(options){options=options||{};validateViewSelector(options);var payload={label:options.label,windowId:options.windowId};var frame=optionalFramePayload(options);if(frame){payload.frame=frame;}if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.visible!=null){payload.visible=!!options.visible;}if(options.enabled!=null){payload.enabled=!!options.enabled;}if(options.role!=null){payload.role=ensureString(options.role,'role');}if(options.url!=null){payload.url=ensureString(options.url,'url');}return payload;}"
+        "function viewFramePayload(options){options=options||{};validateViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}"
+        "function viewVisiblePayload(options){options=options||{};validateViewSelector(options);if(options.visible==null){throw new TypeError('visible is required');}return {label:options.label,windowId:options.windowId,visible:!!options.visible};}"
+        "function viewHandle(info){return Object.freeze(Object.assign({},info,{update:function(patch){return views.update(Object.assign({},patch||{},{label:info.label,windowId:info.windowId}));},setFrame:function(frame){return views.setFrame({label:info.label,windowId:info.windowId,frame:frame});},setVisible:function(visible){return views.setVisible({label:info.label,windowId:info.windowId,visible:visible});},focus:function(){return views.focus({label:info.label,windowId:info.windowId});},close:function(){return views.close({label:info.label,windowId:info.windowId});}}));}"
         "function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}"
         "function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}"
         "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}"
+        "var commands=Object.freeze({"
+        "invoke:function(value){return invoke('zero-native.command.invoke',commandPayload(value));}"
+        "});"
         "var windows=Object.freeze({"
         "create:function(options){return invoke('zero-native.window.create',options||{});},"
         "list:function(){return invoke('zero-native.window.list',{});},"
@@ -332,6 +357,20 @@ static const char *ZeroNativeCefBridgeScript() {
         "openFile:function(options){return invoke('zero-native.dialog.openFile',options||{});},"
         "saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},"
         "showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}"
+        "});"
+        "var os=Object.freeze({"
+        "openUrl:function(value){var options=typeof value==='string'?{url:value}:(value||{});return invoke('zero-native.os.openUrl',{url:ensureString(options.url,'url')});},"
+        "showNotification:function(value){var options=typeof value==='string'?{title:value}:(value||{});var payload={title:ensureString(options.title,'title')};if(options.subtitle!=null){payload.subtitle=ensureString(options.subtitle,'subtitle');}if(options.body!=null){payload.body=ensureString(options.body,'body');}return invoke('zero-native.os.showNotification',payload);},"
+        "revealPath:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('zero-native.os.revealPath',{path:ensureString(options.path,'path')});},"
+        "addRecentDocument:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('zero-native.os.addRecentDocument',{path:ensureString(options.path,'path')});},"
+        "clearRecentDocuments:function(){return invoke('zero-native.os.clearRecentDocuments',{});}"
+        "});"
+        "function credentialPayload(value){value=value||{};return {service:ensureString(value.service,'service'),account:ensureString(value.account,'account')};}"
+        "function credentialSetPayload(value){var payload=credentialPayload(value);payload.secret=ensureString(value.secret!=null?value.secret:value.value,'secret');return payload;}"
+        "var credentials=Object.freeze({"
+        "set:function(value){return invoke('zero-native.credentials.set',credentialSetPayload(value));},"
+        "get:function(value){return invoke('zero-native.credentials.get',credentialPayload(value));},"
+        "delete:function(value){return invoke('zero-native.credentials.delete',credentialPayload(value));}"
         "});"
         "function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}"
         "function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}"
@@ -344,7 +383,16 @@ static const char *ZeroNativeCefBridgeScript() {
         "setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},"
         "close:function(options){return invoke('zero-native.webview.close',closePayload(options));}"
         "});"
-        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});"
+        "var views=Object.freeze({"
+        "create:function(options){return invoke('zero-native.view.create',viewCreatePayload(options)).then(viewHandle);},"
+        "list:function(){return invoke('zero-native.view.list',{});},"
+        "update:function(options){return invoke('zero-native.view.update',viewPatchPayload(options)).then(viewHandle);},"
+        "setFrame:function(options){return invoke('zero-native.view.setFrame',viewFramePayload(options)).then(viewHandle);},"
+        "setVisible:function(options){return invoke('zero-native.view.setVisible',viewVisiblePayload(options)).then(viewHandle);},"
+        "focus:function(options){options=options||{};validateViewSelector(options);return invoke('zero-native.view.focus',{label:options.label,windowId:options.windowId}).then(viewHandle);},"
+        "close:function(options){options=options||{};validateViewSelector(options);return invoke('zero-native.view.close',{label:options.label,windowId:options.windowId});}"
+        "});"
+        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,commands:commands,windows:windows,dialogs:dialogs,os:os,credentials:credentials,webviews:webviews,views:views,_complete:complete,_emit:emit}),configurable:false});"
         "})();";
 }
 
@@ -402,6 +450,7 @@ static const char *ZeroNativeCefBridgeScript() {
 @property(nonatomic, assign) void *context;
 @property(nonatomic, assign) void *bridgeContext;
 @property(nonatomic, assign) BOOL didShutdown;
+@property(nonatomic, assign) BOOL observesApplicationActivation;
 @property(nonatomic, strong) id shortcutEventMonitor;
 @property(nonatomic, strong) NSArray<ZeroNativeChromiumShortcut *> *shortcuts;
 @property(nonatomic, strong) NSStatusItem *statusItem;
@@ -426,6 +475,10 @@ static const char *ZeroNativeCefBridgeScript() {
 - (void)runWithCallback:(zero_native_appkit_event_callback_t)callback context:(void *)context;
 - (void)stop;
 - (void)emitEvent:(zero_native_appkit_event_t)event;
+- (void)startApplicationActivationObservers;
+- (void)stopApplicationActivationObservers;
+- (void)applicationDidBecomeActive:(NSNotification *)notification;
+- (void)applicationDidResignActive:(NSNotification *)notification;
 - (void)emitResize;
 - (void)emitResizeForWindowId:(uint64_t)windowId;
 - (void)emitWindowFrameForWindowId:(uint64_t)windowId open:(BOOL)open;
@@ -542,6 +595,7 @@ static const char *ZeroNativeCefBridgeScript() {
 
     [self createWindowWithId:1 title:(title.length > 0 ? title : self.appName) label:@"main" x:0 y:0 width:width height:height restoreFrame:NO makeMain:YES];
     self.didShutdown = NO;
+    self.observesApplicationActivation = NO;
     return self;
 }
 
@@ -733,6 +787,7 @@ static const char *ZeroNativeCefBridgeScript() {
     [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_START }];
     [self emitResize];
     [self emitWindowFrameForWindowId:1 open:YES];
+    [self startApplicationActivationObservers];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
                                                  target:self
                                                selector:@selector(emitFrame)
@@ -749,6 +804,7 @@ static const char *ZeroNativeCefBridgeScript() {
         [NSEvent removeMonitor:self.shortcutEventMonitor];
         self.shortcutEventMonitor = nil;
     }
+    [self stopApplicationActivationObservers];
     if (self.browsers) {
         for (auto &entry : *self.browsers) {
             if (entry.second) entry.second->GetHost()->CloseBrowser(true);
@@ -771,6 +827,32 @@ static const char *ZeroNativeCefBridgeScript() {
 
 - (void)emitEvent:(zero_native_appkit_event_t)event {
     if (self.callback) self.callback(self.context, &event);
+}
+
+- (void)startApplicationActivationObservers {
+    if (self.observesApplicationActivation) return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self selector:@selector(applicationDidBecomeActive:) name:NSApplicationDidBecomeActiveNotification object:NSApp];
+    [center addObserver:self selector:@selector(applicationDidResignActive:) name:NSApplicationDidResignActiveNotification object:NSApp];
+    self.observesApplicationActivation = YES;
+}
+
+- (void)stopApplicationActivationObservers {
+    if (!self.observesApplicationActivation) return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:NSApplicationDidBecomeActiveNotification object:NSApp];
+    [center removeObserver:self name:NSApplicationDidResignActiveNotification object:NSApp];
+    self.observesApplicationActivation = NO;
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_APP_ACTIVATED }];
+}
+
+- (void)applicationDidResignActive:(NSNotification *)notification {
+    (void)notification;
+    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_APP_DEACTIVATED }];
 }
 
 - (void)emitResize {
@@ -1560,6 +1642,108 @@ void zero_native_appkit_set_security_policy(zero_native_appkit_host_t *host, con
     [object setAllowedNavigationOrigins:origins externalURLs:externalURLs externalAction:external_action];
 }
 
+void zero_native_appkit_set_menus(zero_native_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {
+    (void)host;
+    (void)menu_titles;
+    (void)menu_title_lens;
+    (void)menu_count;
+    (void)item_menu_indices;
+    (void)item_labels;
+    (void)item_label_lens;
+    (void)item_commands;
+    (void)item_command_lens;
+    (void)item_keys;
+    (void)item_key_lens;
+    (void)item_modifiers;
+    (void)item_separators;
+    (void)item_enabled;
+    (void)item_checked;
+    (void)item_count;
+}
+
+int zero_native_appkit_create_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *command, size_t command_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)kind;
+    (void)parent;
+    (void)parent_len;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)layer;
+    (void)visible;
+    (void)enabled;
+    (void)role;
+    (void)role_len;
+    (void)command;
+    (void)command_len;
+    return 0;
+}
+
+int zero_native_appkit_update_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int has_frame, double x, double y, double width, double height, int has_layer, int layer, int has_visible, int visible, int has_enabled, int enabled, const char *role, size_t role_len, int has_command, const char *command, size_t command_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)has_frame;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)has_layer;
+    (void)layer;
+    (void)has_visible;
+    (void)visible;
+    (void)has_enabled;
+    (void)enabled;
+    (void)role;
+    (void)role_len;
+    (void)has_command;
+    (void)command;
+    (void)command_len;
+    return 0;
+}
+
+int zero_native_appkit_set_view_frame(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    return 0;
+}
+
+int zero_native_appkit_set_view_visible(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int visible) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)visible;
+    return 0;
+}
+
+int zero_native_appkit_focus_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
+}
+
+int zero_native_appkit_close_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
+}
+
 void zero_native_appkit_set_shortcuts(zero_native_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
     ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
@@ -1639,6 +1823,104 @@ void zero_native_appkit_clipboard_write(zero_native_appkit_host_t *host, const c
     NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
     [pasteboard clearContents];
     [pasteboard setString:value forType:NSPasteboardTypeString];
+}
+
+int zero_native_appkit_show_notification(zero_native_appkit_host_t *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
+    (void)host;
+    NSString *titleString = title ? [[NSString alloc] initWithBytes:title length:title_len encoding:NSUTF8StringEncoding] : @"";
+    if (titleString.length == 0) return 0;
+    NSString *subtitleString = subtitle ? [[NSString alloc] initWithBytes:subtitle length:subtitle_len encoding:NSUTF8StringEncoding] : @"";
+    NSString *bodyString = body ? [[NSString alloc] initWithBytes:body length:body_len encoding:NSUTF8StringEncoding] : @"";
+    NSUserNotification *notification = [[NSUserNotification alloc] init];
+    notification.title = titleString;
+    if (subtitleString.length > 0) notification.subtitle = subtitleString;
+    if (bodyString.length > 0) notification.informativeText = bodyString;
+    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+    return 1;
+}
+
+int zero_native_appkit_open_external_url(zero_native_appkit_host_t *host, const char *url, size_t url_len) {
+    (void)host;
+    NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
+    if (urlString.length == 0) return 0;
+    NSURL *target = [NSURL URLWithString:urlString];
+    if (!target || target.scheme.length == 0) return 0;
+    return [[NSWorkspace sharedWorkspace] openURL:target] ? 1 : 0;
+}
+
+int zero_native_appkit_reveal_path(zero_native_appkit_host_t *host, const char *path, size_t path_len) {
+    (void)host;
+    NSString *pathString = path ? [[NSString alloc] initWithBytes:path length:path_len encoding:NSUTF8StringEncoding] : @"";
+    if (pathString.length == 0) return 0;
+    NSURL *fileURL = [NSURL fileURLWithPath:pathString];
+    if (!fileURL) return 0;
+    [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ fileURL ]];
+    return 1;
+}
+
+int zero_native_appkit_add_recent_document(zero_native_appkit_host_t *host, const char *path, size_t path_len) {
+    (void)host;
+    NSString *pathString = path ? [[NSString alloc] initWithBytes:path length:path_len encoding:NSUTF8StringEncoding] : @"";
+    if (pathString.length == 0) return 0;
+    NSURL *fileURL = [NSURL fileURLWithPath:pathString];
+    if (!fileURL) return 0;
+    [[NSDocumentController sharedDocumentController] noteNewRecentDocumentURL:fileURL];
+    return 1;
+}
+
+int zero_native_appkit_clear_recent_documents(zero_native_appkit_host_t *host) {
+    (void)host;
+    [[NSDocumentController sharedDocumentController] clearRecentDocuments:nil];
+    return 1;
+}
+
+int zero_native_appkit_set_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
+    (void)host;
+    @autoreleasepool {
+        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
+        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        if (serviceString.length == 0 || accountString.length == 0 || !secret || secret_len == 0) return 0;
+        NSData *secretData = [NSData dataWithBytes:secret length:secret_len];
+        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        NSDictionary *update = @{ (__bridge id)kSecValueData: secretData };
+        OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)update);
+        if (status == errSecItemNotFound) {
+            query[(__bridge id)kSecValueData] = secretData;
+            status = SecItemAdd((__bridge CFDictionaryRef)query, NULL);
+        }
+        return status == errSecSuccess ? 1 : 0;
+    }
+}
+
+size_t zero_native_appkit_get_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
+    (void)host;
+    @autoreleasepool {
+        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
+        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        if (serviceString.length == 0 || accountString.length == 0 || !buffer) return 0;
+        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        query[(__bridge id)kSecReturnData] = @YES;
+        query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+        if (status != errSecSuccess || !result) return 0;
+        NSData *data = CFBridgingRelease(result);
+        if (data.length > buffer_len) return data.length;
+        memcpy(buffer, data.bytes, data.length);
+        return data.length;
+    }
+}
+
+int zero_native_appkit_delete_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len) {
+    (void)host;
+    @autoreleasepool {
+        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
+        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        if (serviceString.length == 0 || accountString.length == 0) return 0;
+        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
+        return status == errSecSuccess ? 1 : 0;
+    }
 }
 
 static NSArray<NSString *> *ZeroNativeParseExtensions(const char *extensions, size_t len) {

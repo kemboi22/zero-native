@@ -14,6 +14,18 @@ pub const Error = error{
     FocusFailed,
     CloseFailed,
     InvalidShortcut,
+    InvalidMenuOptions,
+    InvalidCommand,
+    InvalidViewOptions,
+    InvalidViewWindowId,
+    CrossWindowViewDenied,
+    ViewNotFound,
+    ViewLimitReached,
+    DuplicateViewLabel,
+    ViewLabelTooLarge,
+    ViewRoleTooLarge,
+    UnsupportedViewKind,
+    UnsupportedViewFocus,
     MissingWebViewUrl,
     InvalidWebViewOptions,
     WebViewNotFound,
@@ -27,6 +39,17 @@ pub const Error = error{
     UnsupportedMainWebViewZoom,
     UnsupportedMainWebViewLayer,
     NavigationDenied,
+    InvalidExternalUrl,
+    ExternalUrlTooLarge,
+    InvalidRevealPath,
+    RevealPathTooLarge,
+    InvalidRecentDocumentPath,
+    RecentDocumentPathTooLarge,
+    InvalidNotificationOptions,
+    NotificationFieldTooLarge,
+    InvalidCredentialOptions,
+    CredentialFieldTooLarge,
+    CredentialNotFound,
 };
 
 pub const WebEngine = enum {
@@ -73,6 +96,27 @@ pub const max_window_source_bytes: usize = 4096;
 pub const max_webviews: usize = 16;
 pub const max_webview_label_bytes: usize = 64;
 pub const max_webview_url_bytes: usize = 4096;
+pub const max_external_url_bytes: usize = 4096;
+pub const max_reveal_path_bytes: usize = 4096;
+pub const max_recent_document_path_bytes: usize = 4096;
+pub const max_notification_title_bytes: usize = 128;
+pub const max_notification_subtitle_bytes: usize = 128;
+pub const max_notification_body_bytes: usize = 1024;
+pub const max_credential_service_bytes: usize = 128;
+pub const max_credential_account_bytes: usize = 256;
+pub const max_credential_secret_bytes: usize = 4096;
+pub const max_window_event_name_bytes: usize = 64;
+pub const max_window_event_detail_bytes: usize = 1024;
+pub const max_views: usize = 32;
+pub const max_view_label_bytes: usize = 64;
+pub const max_view_role_bytes: usize = 64;
+pub const max_view_command_bytes: usize = 128;
+pub const max_menus: usize = 16;
+pub const max_menu_items: usize = 128;
+pub const max_menu_title_bytes: usize = 64;
+pub const max_menu_item_label_bytes: usize = 128;
+pub const max_menu_command_bytes: usize = 128;
+pub const max_menu_key_bytes: usize = 32;
 pub const max_shortcuts: usize = 64;
 pub const max_shortcut_id_bytes: usize = 64;
 pub const max_shortcut_key_bytes: usize = 32;
@@ -102,10 +146,53 @@ pub const ShortcutEvent = struct {
     window_id: WindowId = 1,
 };
 
+pub const Menu = struct {
+    title: []const u8,
+    items: []const MenuItem = &.{},
+};
+
+pub const MenuItem = struct {
+    label: []const u8 = "",
+    command: []const u8 = "",
+    key: []const u8 = "",
+    modifiers: ShortcutModifiers = .{},
+    separator: bool = false,
+    enabled: bool = true,
+    checked: bool = false,
+};
+
 pub fn validateShortcut(shortcut: Shortcut) Error!void {
-    if (shortcut.id.len == 0 or shortcut.id.len > max_shortcut_id_bytes) return error.InvalidShortcut;
+    if (!isValidCommandId(shortcut.id, max_shortcut_id_bytes)) return error.InvalidShortcut;
     if (!isValidShortcutKey(shortcut.key)) return error.InvalidShortcut;
     if (!shortcut.modifiers.hasAny() and shortcutRequiresModifier(shortcut.key)) return error.InvalidShortcut;
+}
+
+pub fn validateMenus(menus: []const Menu) Error!void {
+    if (menus.len > max_menus) return error.InvalidMenuOptions;
+    var item_count: usize = 0;
+    for (menus) |menu| {
+        if (menu.title.len == 0 or menu.title.len > max_menu_title_bytes) return error.InvalidMenuOptions;
+        item_count += menu.items.len;
+        if (item_count > max_menu_items) return error.InvalidMenuOptions;
+        for (menu.items) |item| try validateMenuItem(item);
+    }
+}
+
+pub fn validateMenuItem(item: MenuItem) Error!void {
+    if (item.separator) return;
+    if (item.label.len == 0 or item.label.len > max_menu_item_label_bytes) return error.InvalidMenuOptions;
+    if (!isValidCommandId(item.command, max_menu_command_bytes)) return error.InvalidCommand;
+    if (item.key.len > 0 and !isValidShortcutKey(item.key)) return error.InvalidShortcut;
+    if (item.key.len > max_menu_key_bytes) return error.InvalidShortcut;
+}
+
+fn isValidCommandId(command: []const u8, max_len: usize) bool {
+    if (command.len == 0 or command.len > max_len) return false;
+    if (std.mem.eql(u8, command, ".") or std.mem.eql(u8, command, "..")) return false;
+    for (command) |ch| {
+        if (ch == 0 or ch == '/' or ch == '\\' or ch == '\n' or ch == '\r' or ch == '\t') return false;
+    }
+    return true;
 }
 
 pub fn isValidShortcutKey(key: []const u8) bool {
@@ -241,6 +328,79 @@ pub const WebViewInfo = struct {
     open: bool = true,
 };
 
+pub const ViewKind = enum {
+    webview,
+    toolbar,
+    titlebar_accessory,
+    sidebar,
+    statusbar,
+    split,
+    stack,
+    button,
+    checkbox,
+    toggle,
+    text_field,
+    search_field,
+    label,
+    spacer,
+    gpu_surface,
+};
+
+pub const ViewOptions = struct {
+    window_id: WindowId = 1,
+    label: []const u8,
+    kind: ViewKind,
+    parent: ?[]const u8 = null,
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: []const u8 = "",
+    command: []const u8 = "",
+    url: []const u8 = "",
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+
+    pub fn webViewOptions(self: ViewOptions) WebViewOptions {
+        return .{
+            .window_id = self.window_id,
+            .label = self.label,
+            .url = self.url,
+            .frame = self.frame,
+            .layer = self.layer,
+            .transparent = self.transparent,
+            .bridge_enabled = self.bridge_enabled,
+        };
+    }
+};
+
+pub const ViewPatch = struct {
+    frame: ?geometry.RectF = null,
+    layer: ?i32 = null,
+    visible: ?bool = null,
+    enabled: ?bool = null,
+    role: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+};
+
+pub const ViewInfo = struct {
+    window_id: WindowId = 1,
+    label: []const u8 = "",
+    kind: ViewKind = .webview,
+    parent: ?[]const u8 = null,
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: []const u8 = "",
+    command: []const u8 = "",
+    url: []const u8 = "",
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+    open: bool = true,
+};
+
 pub const AppInfo = struct {
     app_name: []const u8 = "zero-native",
     window_title: []const u8 = "",
@@ -339,6 +499,23 @@ pub const MessageDialogOptions = struct {
     tertiary_button: []const u8 = "",
 };
 
+pub const NotificationOptions = struct {
+    title: []const u8,
+    subtitle: []const u8 = "",
+    body: []const u8 = "",
+};
+
+pub const CredentialKey = struct {
+    service: []const u8,
+    account: []const u8,
+};
+
+pub const Credential = struct {
+    service: []const u8,
+    account: []const u8,
+    secret: []const u8,
+};
+
 pub const TrayItemId = u32;
 
 pub const TrayOptions = struct {
@@ -354,8 +531,21 @@ pub const TrayMenuItem = struct {
     enabled: bool = true,
 };
 
+pub const NativeCommandEvent = struct {
+    name: []const u8,
+    window_id: WindowId = 1,
+    view_label: []const u8 = "",
+};
+
+pub const MenuCommandEvent = struct {
+    name: []const u8,
+    window_id: WindowId = 1,
+};
+
 pub const Event = union(enum) {
     app_start,
+    app_activated,
+    app_deactivated,
     frame_requested,
     app_shutdown,
     surface_resized: Surface,
@@ -364,10 +554,14 @@ pub const Event = union(enum) {
     bridge_message: BridgeMessage,
     tray_action: TrayItemId,
     shortcut: ShortcutEvent,
+    native_command: NativeCommandEvent,
+    menu_command: MenuCommandEvent,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
             .app_start => "app_start",
+            .app_activated => "app_activated",
+            .app_deactivated => "app_deactivated",
             .frame_requested => "frame_requested",
             .app_shutdown => "app_shutdown",
             .surface_resized => "surface_resized",
@@ -376,6 +570,8 @@ pub const Event = union(enum) {
             .bridge_message => "bridge_message",
             .tray_action => "tray_action",
             .shortcut => "shortcut",
+            .native_command => "native_command",
+            .menu_command => "menu_command",
         };
     }
 };
@@ -394,6 +590,12 @@ pub const PlatformServices = struct {
     create_window_fn: ?*const fn (context: ?*anyopaque, options: WindowOptions) anyerror!WindowInfo = null,
     focus_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
     close_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
+    create_view_fn: ?*const fn (context: ?*anyopaque, options: ViewOptions) anyerror!void = null,
+    update_view_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, patch: ViewPatch) anyerror!void = null,
+    set_view_frame_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void = null,
+    set_view_visible_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, visible: bool) anyerror!void = null,
+    focus_view_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void = null,
+    close_view_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void = null,
     create_webview_fn: ?*const fn (context: ?*anyopaque, options: WebViewOptions) anyerror!void = null,
     set_webview_frame_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void = null,
     navigate_webview_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, url: []const u8) anyerror!void = null,
@@ -403,10 +605,19 @@ pub const PlatformServices = struct {
     show_open_dialog_fn: ?*const fn (context: ?*anyopaque, options: OpenDialogOptions, buffer: []u8) anyerror!OpenDialogResult = null,
     show_save_dialog_fn: ?*const fn (context: ?*anyopaque, options: SaveDialogOptions, buffer: []u8) anyerror!?[]const u8 = null,
     show_message_dialog_fn: ?*const fn (context: ?*anyopaque, options: MessageDialogOptions) anyerror!MessageDialogResult = null,
+    show_notification_fn: ?*const fn (context: ?*anyopaque, options: NotificationOptions) anyerror!void = null,
+    set_credential_fn: ?*const fn (context: ?*anyopaque, credential: Credential) anyerror!void = null,
+    get_credential_fn: ?*const fn (context: ?*anyopaque, key: CredentialKey, buffer: []u8) anyerror![]const u8 = null,
+    delete_credential_fn: ?*const fn (context: ?*anyopaque, key: CredentialKey) anyerror!void = null,
+    open_external_url_fn: ?*const fn (context: ?*anyopaque, url: []const u8) anyerror!void = null,
+    reveal_path_fn: ?*const fn (context: ?*anyopaque, path: []const u8) anyerror!void = null,
+    add_recent_document_fn: ?*const fn (context: ?*anyopaque, path: []const u8) anyerror!void = null,
+    clear_recent_documents_fn: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     create_tray_fn: ?*const fn (context: ?*anyopaque, options: TrayOptions) anyerror!void = null,
     update_tray_menu_fn: ?*const fn (context: ?*anyopaque, items: []const TrayMenuItem) anyerror!void = null,
     remove_tray_fn: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     configure_security_policy_fn: ?*const fn (context: ?*anyopaque, policy: security.Policy) anyerror!void = null,
+    configure_menus_fn: ?*const fn (context: ?*anyopaque, menus: []const Menu) anyerror!void = null,
     configure_shortcuts_fn: ?*const fn (context: ?*anyopaque, shortcuts: []const Shortcut) anyerror!void = null,
     emit_window_event_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, name: []const u8, detail_json: []const u8) anyerror!void = null,
 
@@ -465,6 +676,41 @@ pub const PlatformServices = struct {
         return close_fn(self.context, window_id);
     }
 
+    pub fn createView(self: PlatformServices, options: ViewOptions) anyerror!void {
+        if (self.create_view_fn) |create_fn| return create_fn(self.context, options);
+        if (options.kind == .webview) return self.createWebView(options.webViewOptions());
+        return error.UnsupportedViewKind;
+    }
+
+    pub fn updateView(self: PlatformServices, window_id: WindowId, label: []const u8, patch: ViewPatch) anyerror!void {
+        const update_fn = self.update_view_fn orelse return error.UnsupportedViewKind;
+        return update_fn(self.context, window_id, label, patch);
+    }
+
+    pub fn setViewFrame(self: PlatformServices, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
+        if (self.set_view_frame_fn) |set_fn| return set_fn(self.context, window_id, label, frame);
+        if (std.mem.eql(u8, label, "main")) return self.setWebViewFrame(window_id, label, frame);
+        return error.UnsupportedViewKind;
+    }
+
+    pub fn setViewVisible(self: PlatformServices, window_id: WindowId, label: []const u8, visible: bool) anyerror!void {
+        const set_fn = self.set_view_visible_fn orelse return error.UnsupportedViewKind;
+        return set_fn(self.context, window_id, label, visible);
+    }
+
+    pub fn focusView(self: PlatformServices, window_id: WindowId, label: []const u8) anyerror!void {
+        const focus_fn = self.focus_view_fn orelse {
+            return error.UnsupportedViewFocus;
+        };
+        return focus_fn(self.context, window_id, label);
+    }
+
+    pub fn closeView(self: PlatformServices, window_id: WindowId, label: []const u8) anyerror!void {
+        if (self.close_view_fn) |close_fn| return close_fn(self.context, window_id, label);
+        if (!std.mem.eql(u8, label, "main")) return self.closeWebView(window_id, label);
+        return error.InvalidViewOptions;
+    }
+
     pub fn createWebView(self: PlatformServices, options: WebViewOptions) anyerror!void {
         const create_fn = self.create_webview_fn orelse return error.UnsupportedService;
         return create_fn(self.context, options);
@@ -510,6 +756,46 @@ pub const PlatformServices = struct {
         return msg_fn(self.context, options);
     }
 
+    pub fn showNotification(self: PlatformServices, options: NotificationOptions) anyerror!void {
+        const notify_fn = self.show_notification_fn orelse return error.UnsupportedService;
+        return notify_fn(self.context, options);
+    }
+
+    pub fn setCredential(self: PlatformServices, credential: Credential) anyerror!void {
+        const set_fn = self.set_credential_fn orelse return error.UnsupportedService;
+        return set_fn(self.context, credential);
+    }
+
+    pub fn getCredential(self: PlatformServices, key: CredentialKey, buffer: []u8) anyerror![]const u8 {
+        const get_fn = self.get_credential_fn orelse return error.UnsupportedService;
+        return get_fn(self.context, key, buffer);
+    }
+
+    pub fn deleteCredential(self: PlatformServices, key: CredentialKey) anyerror!void {
+        const delete_fn = self.delete_credential_fn orelse return error.UnsupportedService;
+        return delete_fn(self.context, key);
+    }
+
+    pub fn openExternalUrl(self: PlatformServices, url: []const u8) anyerror!void {
+        const open_fn = self.open_external_url_fn orelse return error.UnsupportedService;
+        return open_fn(self.context, url);
+    }
+
+    pub fn revealPath(self: PlatformServices, path: []const u8) anyerror!void {
+        const reveal_fn = self.reveal_path_fn orelse return error.UnsupportedService;
+        return reveal_fn(self.context, path);
+    }
+
+    pub fn addRecentDocument(self: PlatformServices, path: []const u8) anyerror!void {
+        const add_fn = self.add_recent_document_fn orelse return error.UnsupportedService;
+        return add_fn(self.context, path);
+    }
+
+    pub fn clearRecentDocuments(self: PlatformServices) anyerror!void {
+        const clear_fn = self.clear_recent_documents_fn orelse return error.UnsupportedService;
+        return clear_fn(self.context);
+    }
+
     pub fn createTray(self: PlatformServices, options: TrayOptions) anyerror!void {
         const tray_fn = self.create_tray_fn orelse return error.UnsupportedService;
         return tray_fn(self.context, options);
@@ -528,6 +814,14 @@ pub const PlatformServices = struct {
     pub fn configureSecurityPolicy(self: PlatformServices, policy: security.Policy) anyerror!void {
         const configure_fn = self.configure_security_policy_fn orelse return error.UnsupportedService;
         return configure_fn(self.context, policy);
+    }
+
+    pub fn configureMenus(self: PlatformServices, menus: []const Menu) anyerror!void {
+        const configure_fn = self.configure_menus_fn orelse {
+            if (menus.len == 0) return;
+            return error.UnsupportedService;
+        };
+        return configure_fn(self.context, menus);
     }
 
     pub fn configureShortcuts(self: PlatformServices, shortcuts: []const Shortcut) anyerror!void {
@@ -562,7 +856,7 @@ pub const Platform = struct {
 };
 
 pub const Backend = enum {
-    @"null",
+    null,
     macos,
     linux,
     windows,
@@ -575,17 +869,51 @@ pub const NullPlatform = struct {
     requested_frames: u32 = 1,
     loaded_source: ?WebViewSource = null,
     security_policy: security.Policy = .{},
+    menus: [max_menus]Menu = undefined,
+    menu_items: [max_menu_items]MenuItem = undefined,
+    menu_count: usize = 0,
+    menu_item_count: usize = 0,
     shortcuts: [max_shortcuts]Shortcut = undefined,
     shortcut_count: usize = 0,
     window_sources: [max_windows]?WebViewSource = [_]?WebViewSource{null} ** max_windows,
     windows: [max_windows]WindowInfo = undefined,
     window_count: usize = 0,
+    views: [max_views]NullView = undefined,
+    view_count: usize = 0,
     webviews: [max_webviews]NullWebView = undefined,
     webview_count: usize = 0,
     bridge_response: [16 * 1024]u8 = undefined,
     bridge_response_len: usize = 0,
     bridge_response_window_id: WindowId = 0,
     bridge_response_webview_label: []const u8 = "main",
+    external_url: [max_external_url_bytes]u8 = undefined,
+    external_url_len: usize = 0,
+    revealed_path: [max_reveal_path_bytes]u8 = undefined,
+    revealed_path_len: usize = 0,
+    recent_document_path: [max_recent_document_path_bytes]u8 = undefined,
+    recent_document_path_len: usize = 0,
+    recent_documents_cleared_count: usize = 0,
+    notification_title: [max_notification_title_bytes]u8 = undefined,
+    notification_title_len: usize = 0,
+    notification_subtitle: [max_notification_subtitle_bytes]u8 = undefined,
+    notification_subtitle_len: usize = 0,
+    notification_body: [max_notification_body_bytes]u8 = undefined,
+    notification_body_len: usize = 0,
+    notification_count: usize = 0,
+    credential_service: [max_credential_service_bytes]u8 = undefined,
+    credential_service_len: usize = 0,
+    credential_account: [max_credential_account_bytes]u8 = undefined,
+    credential_account_len: usize = 0,
+    credential_secret: [max_credential_secret_bytes]u8 = undefined,
+    credential_secret_len: usize = 0,
+    credential_set_count: usize = 0,
+    credential_delete_count: usize = 0,
+    window_event_window_id: WindowId = 0,
+    window_event_name: [max_window_event_name_bytes]u8 = undefined,
+    window_event_name_len: usize = 0,
+    window_event_detail: [max_window_event_detail_bytes]u8 = undefined,
+    window_event_detail_len: usize = 0,
+    window_event_count: usize = 0,
 
     pub fn init(surface_value: Surface) NullPlatform {
         return .{ .surface_value = surface_value };
@@ -615,13 +943,28 @@ pub const NullPlatform = struct {
                 .create_window_fn = createWindow,
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
+                .create_view_fn = createView,
+                .update_view_fn = updateView,
+                .set_view_frame_fn = setViewFrame,
+                .set_view_visible_fn = setViewVisible,
+                .focus_view_fn = focusView,
+                .close_view_fn = closeView,
                 .create_webview_fn = createWebView,
                 .set_webview_frame_fn = setWebViewFrame,
                 .navigate_webview_fn = navigateWebView,
                 .set_webview_zoom_fn = setWebViewZoom,
                 .set_webview_layer_fn = setWebViewLayer,
                 .close_webview_fn = closeWebView,
+                .show_notification_fn = showNotification,
+                .set_credential_fn = setCredential,
+                .get_credential_fn = getCredential,
+                .delete_credential_fn = deleteCredential,
+                .open_external_url_fn = openExternalUrl,
+                .reveal_path_fn = revealPath,
+                .add_recent_document_fn = addRecentDocument,
+                .clear_recent_documents_fn = clearRecentDocuments,
                 .configure_security_policy_fn = configureSecurityPolicy,
+                .configure_menus_fn = configureMenus,
                 .configure_shortcuts_fn = configureShortcuts,
                 .emit_window_event_fn = emitWindowEvent,
             },
@@ -741,7 +1084,74 @@ pub const NullPlatform = struct {
         const index = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
         self.windows[index].open = false;
         self.windows[index].focused = false;
+        self.removeViewsForWindow(window_id);
         self.removeWebViewsForWindow(window_id);
+    }
+
+    fn createView(context: ?*anyopaque, options: ViewOptions) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (options.kind == .webview) return createWebView(context, options.webViewOptions());
+        try self.validateViewOptions(options);
+        if (self.findViewIndex(options.window_id, options.label) != null) return error.DuplicateViewLabel;
+        if (self.view_count >= max_views) return error.ViewLimitReached;
+        const index = self.view_count;
+        self.view_count += 1;
+        self.views[index] = .{
+            .window_id = options.window_id,
+            .kind = options.kind,
+            .frame = options.frame,
+            .layer = options.layer,
+            .visible = options.visible,
+            .enabled = options.enabled,
+            .open = true,
+        };
+        try self.copyViewStrings(index, options.label, options.parent, options.role, options.command);
+    }
+
+    fn updateView(context: ?*anyopaque, window_id: WindowId, label: []const u8, patch: ViewPatch) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        if (patch.frame) |frame| {
+            if (!isValidViewFrame(frame)) return error.InvalidViewOptions;
+            self.views[index].frame = frame;
+        }
+        if (patch.layer) |layer| self.views[index].layer = layer;
+        if (patch.visible) |visible| self.views[index].visible = visible;
+        if (patch.enabled) |enabled| self.views[index].enabled = enabled;
+        if (patch.role) |role| {
+            if (role.len > max_view_role_bytes) return error.ViewRoleTooLarge;
+            self.views[index].role = try copyInto(&self.views[index].role_storage, role);
+        }
+        if (patch.command) |command| {
+            if (command.len > max_view_command_bytes) return error.InvalidCommand;
+            self.views[index].command = try copyInto(&self.views[index].command_storage, command);
+        }
+        if (patch.url != null) return error.InvalidViewOptions;
+    }
+
+    fn setViewFrame(context: ?*anyopaque, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        if (!isValidViewFrame(frame)) return error.InvalidViewOptions;
+        self.views[index].frame = frame;
+    }
+
+    fn setViewVisible(context: ?*anyopaque, window_id: WindowId, label: []const u8, visible: bool) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        self.views[index].visible = visible;
+    }
+
+    fn focusView(context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        if (!self.views[index].enabled or !self.views[index].visible) return error.UnsupportedViewFocus;
+    }
+
+    fn closeView(context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        self.removeViewAt(index);
     }
 
     fn createWebView(context: ?*anyopaque, options: WebViewOptions) anyerror!void {
@@ -823,9 +1233,93 @@ pub const NullPlatform = struct {
         self.removeWebViewAt(index);
     }
 
+    fn showNotification(context: ?*anyopaque, options: NotificationOptions) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.notification_title = undefined;
+        self.notification_subtitle = undefined;
+        self.notification_body = undefined;
+        self.notification_title_len = (try copyInto(&self.notification_title, options.title)).len;
+        self.notification_subtitle_len = (try copyInto(&self.notification_subtitle, options.subtitle)).len;
+        self.notification_body_len = (try copyInto(&self.notification_body, options.body)).len;
+        self.notification_count += 1;
+    }
+
+    fn setCredential(context: ?*anyopaque, credential: Credential) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.credential_service = undefined;
+        self.credential_account = undefined;
+        self.credential_secret = undefined;
+        self.credential_service_len = (try copyInto(&self.credential_service, credential.service)).len;
+        self.credential_account_len = (try copyInto(&self.credential_account, credential.account)).len;
+        self.credential_secret_len = (try copyInto(&self.credential_secret, credential.secret)).len;
+        self.credential_set_count += 1;
+    }
+
+    fn getCredential(context: ?*anyopaque, key: CredentialKey, buffer: []u8) anyerror![]const u8 {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (self.credential_secret_len == 0) return error.CredentialNotFound;
+        if (!std.mem.eql(u8, key.service, self.lastCredentialService()) or !std.mem.eql(u8, key.account, self.lastCredentialAccount())) return error.CredentialNotFound;
+        return try copyInto(buffer, self.lastCredentialSecret());
+    }
+
+    fn deleteCredential(context: ?*anyopaque, key: CredentialKey) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (self.credential_secret_len == 0) return error.CredentialNotFound;
+        if (!std.mem.eql(u8, key.service, self.lastCredentialService()) or !std.mem.eql(u8, key.account, self.lastCredentialAccount())) return error.CredentialNotFound;
+        self.credential_secret_len = 0;
+        self.credential_delete_count += 1;
+    }
+
+    fn openExternalUrl(context: ?*anyopaque, url: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.external_url = undefined;
+        self.external_url_len = 0;
+        self.external_url_len = (try copyInto(&self.external_url, url)).len;
+    }
+
+    fn revealPath(context: ?*anyopaque, path: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.revealed_path = undefined;
+        self.revealed_path_len = 0;
+        self.revealed_path_len = (try copyInto(&self.revealed_path, path)).len;
+    }
+
+    fn addRecentDocument(context: ?*anyopaque, path: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.recent_document_path = undefined;
+        self.recent_document_path_len = 0;
+        self.recent_document_path_len = (try copyInto(&self.recent_document_path, path)).len;
+    }
+
+    fn clearRecentDocuments(context: ?*anyopaque) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.recent_document_path_len = 0;
+        self.recent_documents_cleared_count += 1;
+    }
+
     fn configureSecurityPolicy(context: ?*anyopaque, policy: security.Policy) anyerror!void {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         self.security_policy = policy;
+    }
+
+    fn configureMenus(context: ?*anyopaque, menus: []const Menu) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        try validateMenus(menus);
+        self.menu_count = 0;
+        self.menu_item_count = 0;
+        for (menus) |menu| {
+            const start = self.menu_item_count;
+            for (menu.items) |item| {
+                self.menu_items[self.menu_item_count] = item;
+                self.menu_item_count += 1;
+            }
+            const end = self.menu_item_count;
+            self.menus[self.menu_count] = .{
+                .title = menu.title,
+                .items = self.menu_items[start..end],
+            };
+            self.menu_count += 1;
+        }
     }
 
     fn configureShortcuts(context: ?*anyopaque, shortcuts: []const Shortcut) anyerror!void {
@@ -839,10 +1333,13 @@ pub const NullPlatform = struct {
     }
 
     fn emitWindowEvent(context: ?*anyopaque, window_id: WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
-        _ = context;
-        _ = window_id;
-        _ = name;
-        _ = detail_json;
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.window_event_name = undefined;
+        self.window_event_detail = undefined;
+        self.window_event_window_id = window_id;
+        self.window_event_name_len = (try copyInto(&self.window_event_name, name)).len;
+        self.window_event_detail_len = (try copyInto(&self.window_event_detail, detail_json)).len;
+        self.window_event_count += 1;
     }
 
     fn findWindowIndex(self: *const NullPlatform, window_id: WindowId) ?usize {
@@ -857,6 +1354,67 @@ pub const NullPlatform = struct {
             if (webview.open and webview.window_id == window_id and std.mem.eql(u8, webview.label, label)) return index;
         }
         return null;
+    }
+
+    fn findViewIndex(self: *const NullPlatform, window_id: WindowId, label: []const u8) ?usize {
+        for (self.views[0..self.view_count], 0..) |view, index| {
+            if (view.open and view.window_id == window_id and std.mem.eql(u8, view.label, label)) return index;
+        }
+        return null;
+    }
+
+    fn validateViewOptions(self: *const NullPlatform, options: ViewOptions) !void {
+        if (self.findWindowIndex(options.window_id)) |window_index| {
+            if (!self.windows[window_index].open) return error.WindowNotFound;
+        } else if (options.window_id != 1) {
+            return error.WindowNotFound;
+        }
+        if (options.label.len == 0) return error.InvalidViewOptions;
+        if (options.label.len > max_view_label_bytes) return error.ViewLabelTooLarge;
+        if (options.role.len > max_view_role_bytes) return error.ViewRoleTooLarge;
+        if (options.command.len > max_view_command_bytes) return error.InvalidCommand;
+        if (!isValidViewFrame(options.frame)) return error.InvalidViewOptions;
+        if (options.url.len > 0) return error.InvalidViewOptions;
+        if (std.mem.eql(u8, options.label, "main")) return error.DuplicateViewLabel;
+        if (self.findWebViewIndex(options.window_id, options.label) != null) return error.DuplicateViewLabel;
+    }
+
+    fn copyViewStrings(self: *NullPlatform, index: usize, label: []const u8, parent: ?[]const u8, role: []const u8, command: []const u8) !void {
+        self.views[index].label = try copyInto(&self.views[index].label_storage, label);
+        self.views[index].parent = if (parent) |value| try copyInto(&self.views[index].parent_storage, value) else null;
+        self.views[index].role = try copyInto(&self.views[index].role_storage, role);
+        self.views[index].command = try copyInto(&self.views[index].command_storage, command);
+    }
+
+    fn removeViewAt(self: *NullPlatform, index: usize) void {
+        if (index >= self.view_count) return;
+        var cursor = index;
+        while (cursor + 1 < self.view_count) : (cursor += 1) {
+            const next = self.views[cursor + 1];
+            self.views[cursor] = .{
+                .window_id = next.window_id,
+                .kind = next.kind,
+                .frame = next.frame,
+                .layer = next.layer,
+                .visible = next.visible,
+                .enabled = next.enabled,
+                .command = next.command,
+                .open = next.open,
+            };
+            self.copyViewStrings(cursor, next.label, next.parent, next.role, next.command) catch unreachable;
+        }
+        self.view_count -= 1;
+    }
+
+    fn removeViewsForWindow(self: *NullPlatform, window_id: WindowId) void {
+        var index: usize = 0;
+        while (index < self.view_count) {
+            if (self.views[index].window_id == window_id) {
+                self.removeViewAt(index);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn removeWebViewAt(self: *NullPlatform, index: usize) void {
@@ -904,8 +1462,80 @@ pub const NullPlatform = struct {
         return self.bridge_response_webview_label;
     }
 
+    pub fn lastExternalUrl(self: *const NullPlatform) []const u8 {
+        return self.external_url[0..self.external_url_len];
+    }
+
+    pub fn lastRevealedPath(self: *const NullPlatform) []const u8 {
+        return self.revealed_path[0..self.revealed_path_len];
+    }
+
+    pub fn lastRecentDocumentPath(self: *const NullPlatform) []const u8 {
+        return self.recent_document_path[0..self.recent_document_path_len];
+    }
+
+    pub fn recentDocumentsClearedCount(self: *const NullPlatform) usize {
+        return self.recent_documents_cleared_count;
+    }
+
+    pub fn lastNotificationTitle(self: *const NullPlatform) []const u8 {
+        return self.notification_title[0..self.notification_title_len];
+    }
+
+    pub fn lastNotificationSubtitle(self: *const NullPlatform) []const u8 {
+        return self.notification_subtitle[0..self.notification_subtitle_len];
+    }
+
+    pub fn lastNotificationBody(self: *const NullPlatform) []const u8 {
+        return self.notification_body[0..self.notification_body_len];
+    }
+
+    pub fn notificationCount(self: *const NullPlatform) usize {
+        return self.notification_count;
+    }
+
+    pub fn lastCredentialService(self: *const NullPlatform) []const u8 {
+        return self.credential_service[0..self.credential_service_len];
+    }
+
+    pub fn lastCredentialAccount(self: *const NullPlatform) []const u8 {
+        return self.credential_account[0..self.credential_account_len];
+    }
+
+    pub fn lastCredentialSecret(self: *const NullPlatform) []const u8 {
+        return self.credential_secret[0..self.credential_secret_len];
+    }
+
+    pub fn credentialSetCount(self: *const NullPlatform) usize {
+        return self.credential_set_count;
+    }
+
+    pub fn credentialDeleteCount(self: *const NullPlatform) usize {
+        return self.credential_delete_count;
+    }
+
+    pub fn lastWindowEventWindowId(self: *const NullPlatform) WindowId {
+        return self.window_event_window_id;
+    }
+
+    pub fn lastWindowEventName(self: *const NullPlatform) []const u8 {
+        return self.window_event_name[0..self.window_event_name_len];
+    }
+
+    pub fn lastWindowEventDetail(self: *const NullPlatform) []const u8 {
+        return self.window_event_detail[0..self.window_event_detail_len];
+    }
+
+    pub fn windowEventCount(self: *const NullPlatform) usize {
+        return self.window_event_count;
+    }
+
     pub fn configuredShortcuts(self: *const NullPlatform) []const Shortcut {
         return self.shortcuts[0..self.shortcut_count];
+    }
+
+    pub fn configuredMenus(self: *const NullPlatform) []const Menu {
+        return self.menus[0..self.menu_count];
     }
 };
 
@@ -923,8 +1553,36 @@ const NullWebView = struct {
     url_storage: [max_webview_url_bytes]u8 = undefined,
 };
 
+const NullView = struct {
+    window_id: WindowId = 1,
+    label: []const u8 = "",
+    kind: ViewKind = .toolbar,
+    parent: ?[]const u8 = null,
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: []const u8 = "",
+    command: []const u8 = "",
+    open: bool = false,
+    label_storage: [max_view_label_bytes]u8 = undefined,
+    parent_storage: [max_view_label_bytes]u8 = undefined,
+    role_storage: [max_view_role_bytes]u8 = undefined,
+    command_storage: [max_view_command_bytes]u8 = undefined,
+};
+
+fn copyInto(buffer: []u8, value: []const u8) ![]const u8 {
+    if (value.len > buffer.len) return error.NoSpaceLeft;
+    @memcpy(buffer[0..value.len], value);
+    return buffer[0..value.len];
+}
+
 fn isValidWebViewFrame(frame: geometry.RectF) bool {
     return frame.x >= 0 and frame.y >= 0 and frame.width > 0 and frame.height > 0;
+}
+
+fn isValidViewFrame(frame: geometry.RectF) bool {
+    return frame.x >= 0 and frame.y >= 0 and frame.width >= 0 and frame.height >= 0;
 }
 
 pub const macos = @import("macos/root.zig");
@@ -973,6 +1631,45 @@ test "null platform records bridge response window routing" {
     try std.testing.expectEqualStrings("{\"ok\":true}", null_platform.lastBridgeResponse());
 }
 
+test "null platform records OS actions" {
+    var null_platform = NullPlatform.init(.{});
+    const services = null_platform.platform().services;
+
+    try services.showNotification(.{
+        .title = "Build finished",
+        .subtitle = "zero-native",
+        .body = "All checks passed.",
+    });
+    try services.openExternalUrl("https://example.com/docs");
+    try services.revealPath("/tmp/example.txt");
+    try services.addRecentDocument("/tmp/recent.txt");
+    try services.setCredential(.{ .service = "dev.zero-native.test", .account = "alice", .secret = "secret-token" });
+
+    try std.testing.expectEqual(@as(usize, 1), null_platform.notificationCount());
+    try std.testing.expectEqualStrings("Build finished", null_platform.lastNotificationTitle());
+    try std.testing.expectEqualStrings("zero-native", null_platform.lastNotificationSubtitle());
+    try std.testing.expectEqualStrings("All checks passed.", null_platform.lastNotificationBody());
+    try std.testing.expectEqualStrings("https://example.com/docs", null_platform.lastExternalUrl());
+    try std.testing.expectEqualStrings("/tmp/example.txt", null_platform.lastRevealedPath());
+    try std.testing.expectEqualStrings("/tmp/recent.txt", null_platform.lastRecentDocumentPath());
+    try std.testing.expectEqual(@as(usize, 1), null_platform.credentialSetCount());
+    try std.testing.expectEqualStrings("dev.zero-native.test", null_platform.lastCredentialService());
+    try std.testing.expectEqualStrings("alice", null_platform.lastCredentialAccount());
+    try std.testing.expectEqualStrings("secret-token", null_platform.lastCredentialSecret());
+
+    var credential_buffer: [64]u8 = undefined;
+    const secret = try services.getCredential(.{ .service = "dev.zero-native.test", .account = "alice" }, &credential_buffer);
+    try std.testing.expectEqualStrings("secret-token", secret);
+    try std.testing.expectError(error.CredentialNotFound, services.getCredential(.{ .service = "dev.zero-native.test", .account = "bob" }, &credential_buffer));
+    try services.deleteCredential(.{ .service = "dev.zero-native.test", .account = "alice" });
+    try std.testing.expectEqual(@as(usize, 1), null_platform.credentialDeleteCount());
+    try std.testing.expectError(error.CredentialNotFound, services.getCredential(.{ .service = "dev.zero-native.test", .account = "alice" }, &credential_buffer));
+
+    try services.clearRecentDocuments();
+    try std.testing.expectEqual(@as(usize, 1), null_platform.recentDocumentsClearedCount());
+    try std.testing.expectEqualStrings("", null_platform.lastRecentDocumentPath());
+}
+
 test "null platform records configured shortcuts" {
     const shortcuts = [_]Shortcut{
         .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
@@ -994,6 +1691,27 @@ test "null platform records configured shortcuts" {
 
     const unmodified_text_key = [_]Shortcut{.{ .id = "text", .key = "p" }};
     try std.testing.expectError(error.InvalidShortcut, null_platform.platform().services.configureShortcuts(&unmodified_text_key));
+}
+
+test "null platform records configured menus" {
+    const items = [_]MenuItem{
+        .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
+        .{ .separator = true },
+        .{ .label = "Command Palette", .command = "app.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
+    };
+    const menus = [_]Menu{.{ .title = "App", .items = &items }};
+    var null_platform = NullPlatform.init(.{});
+    try null_platform.platform().services.configureMenus(&menus);
+
+    try std.testing.expectEqual(@as(usize, 1), null_platform.configuredMenus().len);
+    try std.testing.expectEqualStrings("App", null_platform.configuredMenus()[0].title);
+    try std.testing.expectEqual(@as(usize, 3), null_platform.configuredMenus()[0].items.len);
+    try std.testing.expectEqualStrings("app.refresh", null_platform.configuredMenus()[0].items[0].command);
+    try std.testing.expect(null_platform.configuredMenus()[0].items[1].separator);
+
+    const invalid_item = [_]MenuItem{.{ .label = "Missing Command" }};
+    const invalid_menu = [_]Menu{.{ .title = "Invalid", .items = &invalid_item }};
+    try std.testing.expectError(error.InvalidCommand, null_platform.platform().services.configureMenus(&invalid_menu));
 }
 
 test "webview bridge fallback only routes main responses" {
@@ -1028,6 +1746,20 @@ test "shortcut configuration requires backend support for non-empty lists" {
         .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true } },
     };
     try std.testing.expectError(error.UnsupportedService, services.configureShortcuts(&shortcuts));
+}
+
+test "OS actions require backend support" {
+    const services = PlatformServices{};
+
+    try std.testing.expectError(error.UnsupportedService, services.showNotification(.{ .title = "Hello" }));
+    try std.testing.expectError(error.UnsupportedService, services.openExternalUrl("https://example.com"));
+    try std.testing.expectError(error.UnsupportedService, services.revealPath("/tmp/example.txt"));
+    try std.testing.expectError(error.UnsupportedService, services.addRecentDocument("/tmp/example.txt"));
+    try std.testing.expectError(error.UnsupportedService, services.clearRecentDocuments());
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedService, services.setCredential(.{ .service = "service", .account = "account", .secret = "secret" }));
+    try std.testing.expectError(error.UnsupportedService, services.getCredential(.{ .service = "service", .account = "account" }, &buffer));
+    try std.testing.expectError(error.UnsupportedService, services.deleteCredential(.{ .service = "service", .account = "account" }));
 }
 
 test "null platform records webview lifecycle" {

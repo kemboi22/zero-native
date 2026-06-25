@@ -109,8 +109,18 @@ The assets constructor takes a `WebViewAssetSource`:
 The runtime dispatches `LifecycleEvent` values through your `event_fn`:
 
 - **`start`** -- the app has started and the initial source is loaded
+- **`activate`** -- the app became the active foreground app
+- **`deactivate`** -- the app resigned active foreground status
 - **`frame`** -- a frame has been requested (for animations or state updates)
 - **`stop`** -- the app is shutting down
+
+Native hosts also emit `app:activate` and `app:deactivate` to each open `window.zero` instance:
+
+```ts
+window.zero.on("app:activate", () => {
+  refreshForegroundState();
+});
+```
 
 ## The runner pattern
 
@@ -209,7 +219,7 @@ try runtime.run(my_app.app());
       <td><code>js_window_api</code></td>
       <td><code>bool</code></td>
       <td><code>false</code></td>
-      <td>Expose <code>window.zero.windows</code> and <code>window.zero.webviews</code>; origin and <code>window</code> permission checks still apply</td>
+      <td>Expose built-in <code>window.zero</code> helper namespaces for trusted app chrome. Window, view, and WebView helpers require origin and <code>window</code> checks; dialog and OS helpers still require explicit <code>builtin_bridge</code> policy.</td>
     </tr>
   </tbody>
 </table>

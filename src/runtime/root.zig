@@ -5,21 +5,45 @@ const json = @import("json");
 const automation = @import("../automation/root.zig");
 const bridge = @import("../bridge/root.zig");
 const extensions = @import("../extensions/root.zig");
+const app_manifest = @import("app_manifest");
 const platform = @import("../platform/root.zig");
 const security = @import("../security/root.zig");
 const window_state = @import("../window_state/root.zig");
 
 const max_async_bridge_responses: usize = 64;
 const max_bridge_origin_bytes: usize = 512;
+const max_command_id_bytes: usize = 128;
 
 pub const LifecycleEvent = enum {
     start,
+    activate,
+    deactivate,
     frame,
     stop,
 };
 
 pub const CommandEvent = struct {
     name: []const u8,
+    source: CommandSource = .runtime,
+    window_id: platform.WindowId = 0,
+    view_label: []const u8 = "",
+};
+
+pub const Command = struct {
+    id: []const u8,
+    title: []const u8 = "",
+    enabled: bool = true,
+    checked: bool = false,
+};
+
+pub const CommandSource = enum {
+    runtime,
+    menu,
+    shortcut,
+    toolbar,
+    tray,
+    native_view,
+    bridge,
 };
 
 pub const ShortcutEvent = platform.ShortcutEvent;
@@ -93,6 +117,7 @@ pub const Options = struct {
     bridge: ?bridge.Dispatcher = null,
     builtin_bridge: bridge.Policy = .{},
     security: security.Policy = .{},
+    menus: []const platform.Menu = &.{},
     shortcuts: []const platform.Shortcut = &.{},
     automation: ?automation.Server = null,
     window_state_store: ?window_state.Store = null,
@@ -104,8 +129,12 @@ pub const Runtime = struct {
     surface: platform.Surface,
     windows: [platform.max_windows]RuntimeWindow = undefined,
     window_count: usize = 0,
+    views: [platform.max_views]RuntimeView = undefined,
+    view_count: usize = 0,
     webviews: [platform.max_webviews]RuntimeWebView = undefined,
     webview_count: usize = 0,
+    shell_layouts: [platform.max_windows]RuntimeShellLayout = undefined,
+    shell_layout_count: usize = 0,
     next_window_id: platform.WindowId = 2,
     invalidated: bool = true,
     timestamp_ns: i128 = 0,
@@ -118,6 +147,7 @@ pub const Runtime = struct {
     loaded_source: ?platform.WebViewSource = null,
     async_bridge_responses: [max_async_bridge_responses]AsyncBridgeResponseSlot = [_]AsyncBridgeResponseSlot{.{}} ** max_async_bridge_responses,
     automation_windows: [automation.snapshot.max_windows]automation.snapshot.Window = undefined,
+    automation_views: [automation.snapshot.max_views]platform.ViewInfo = undefined,
 
     pub fn init(options: Options) Runtime {
         var runtime = Runtime{
@@ -125,6 +155,8 @@ pub const Runtime = struct {
             .surface = options.platform.surface(),
         };
         runtime.windows = undefined;
+        runtime.views = undefined;
+        runtime.shell_layouts = undefined;
         return runtime;
     }
 
@@ -154,12 +186,25 @@ pub const Runtime = struct {
         }
         try self.log("runtime.init", "runtime initialized", init_fields[0..init_field_count]);
         try self.options.platform.services.configureSecurityPolicy(self.options.security);
+        try self.options.platform.services.configureMenus(self.options.menus);
         try self.options.platform.services.configureShortcuts(self.options.shortcuts);
 
         var context: RunContext = .{ .runtime = self, .app = app };
         try self.options.platform.run(handlePlatformEvent, &context);
 
         try self.log("runtime.done", "runtime finished", &.{});
+    }
+
+    fn reservePrimaryStartupWindow(self: *Runtime) anyerror!void {
+        const app_info = self.options.platform.app_info;
+        if (app_info.startupWindowCount() == 0) return;
+        const window = app_info.resolvedStartupWindow(0);
+        if (self.findWindowIndexById(window.id) != null) return;
+
+        const runtime_index = try self.reserveWindow(window.id, window.label, window.resolvedTitle(app_info.app_name), null);
+        self.windows[runtime_index].info.frame = window.default_frame;
+        self.windows[runtime_index].main_frame = geometry.RectF.init(0, 0, window.default_frame.width, window.default_frame.height);
+        self.next_window_id = @max(self.next_window_id, window.id + 1);
     }
 
     pub fn createWindow(self: *Runtime, options: platform.WindowCreateOptions) anyerror!platform.WindowInfo {
@@ -202,8 +247,233 @@ pub const Runtime = struct {
         try self.options.platform.services.closeWindow(window_id);
         self.windows[index].info.open = false;
         self.windows[index].info.focused = false;
+        self.removeShellLayoutForWindow(window_id);
+        self.removeViewsForWindow(window_id);
         self.removeWebViewsForWindow(window_id);
         self.invalidated = true;
+    }
+
+    pub fn createShellWindow(self: *Runtime, shell_window: app_manifest.ShellWindow, source: ?platform.WebViewSource) anyerror!platform.WindowInfo {
+        const window_frame = geometry.RectF.init(
+            shell_window.x orelse 0,
+            shell_window.y orelse 0,
+            shell_window.width,
+            shell_window.height,
+        );
+        const info = try self.createWindow(.{
+            .label = shell_window.label,
+            .title = shell_window.title orelse "",
+            .default_frame = window_frame,
+            .resizable = shell_window.resizable,
+            .restore_state = shell_window.restore_state,
+            .restore_policy = shellRestorePolicy(shell_window.restore_policy),
+            .source = source,
+        });
+        errdefer self.closeWindow(info.id) catch {};
+
+        try self.createShellViews(info.id, shell_window.views, window_frame);
+        return info;
+    }
+
+    pub fn createShellViews(self: *Runtime, window_id: platform.WindowId, views: []const app_manifest.ShellView, bounds: geometry.RectF) anyerror!void {
+        if (views.len > app_manifest.max_shell_views_per_window) return error.ViewLimitReached;
+        try self.applyShellViews(window_id, views, bounds, .create);
+        try self.bindShellViews(window_id, views);
+    }
+
+    pub fn relayoutShellViews(self: *Runtime, window_id: platform.WindowId) anyerror!void {
+        const binding = self.shellLayoutForWindow(window_id) orelse return;
+        try self.applyShellViews(window_id, binding.views, self.shellBoundsForWindow(window_id), .update);
+    }
+
+    fn applyShellViews(self: *Runtime, window_id: platform.WindowId, views: []const app_manifest.ShellView, bounds: geometry.RectF, mode: ShellApplyMode) anyerror!void {
+        var layout = ShellLayout.init(bounds, views);
+        var created: [app_manifest.max_shell_views_per_window]bool = [_]bool{false} ** app_manifest.max_shell_views_per_window;
+        var created_count: usize = 0;
+        while (created_count < views.len) {
+            var progressed = false;
+            for (views, 0..) |view, index| {
+                if (created[index]) continue;
+                if (view.parent) |parent| {
+                    if (layout.findView(parent) == null) continue;
+                }
+                try self.applyShellView(try shellViewOptions(window_id, view, &layout), mode);
+                created[index] = true;
+                created_count += 1;
+                progressed = true;
+            }
+            if (!progressed) return error.InvalidViewOptions;
+        }
+    }
+
+    fn applyShellView(self: *Runtime, options: platform.ViewOptions, mode: ShellApplyMode) anyerror!void {
+        switch (mode) {
+            .create => {
+                if (options.kind == .webview and isMainWebViewLabel(options.label)) {
+                    _ = try self.updateView(options.window_id, options.label, .{
+                        .frame = options.frame,
+                        .layer = options.layer,
+                    });
+                    return;
+                }
+                _ = try self.createView(options);
+            },
+            .update => {
+                _ = self.updateView(options.window_id, options.label, .{
+                    .frame = options.frame,
+                    .layer = options.layer,
+                }) catch |err| switch (err) {
+                    error.ViewNotFound,
+                    error.WebViewNotFound,
+                    => return,
+                    else => return err,
+                };
+            },
+        }
+    }
+
+    pub fn createView(self: *Runtime, options: platform.ViewOptions) anyerror!platform.ViewInfo {
+        try self.validateViewParent(options.window_id);
+        try validateViewOptions(options);
+        if (self.viewLabelExists(options.window_id, options.label)) return error.DuplicateViewLabel;
+        if (options.kind == .webview) return self.createWebViewView(options);
+        if (self.view_count >= platform.max_views) return error.ViewLimitReached;
+
+        try self.options.platform.services.createView(options);
+        var reserved = false;
+        errdefer {
+            if (reserved) {
+                if (self.findViewIndex(options.window_id, options.label)) |index| self.removeViewAt(index);
+            }
+            self.options.platform.services.closeView(options.window_id, options.label) catch {};
+        }
+        try self.reserveView(options);
+        reserved = true;
+        self.invalidateFor(.command, options.frame);
+        return self.views[self.view_count - 1].info();
+    }
+
+    pub fn updateView(self: *Runtime, window_id: platform.WindowId, label: []const u8, patch: platform.ViewPatch) anyerror!platform.ViewInfo {
+        try self.validateViewParent(window_id);
+        try validateViewLabel(label);
+        if (patch.frame) |view_frame| try validateViewFrame(view_frame);
+        if (patch.role) |role| {
+            if (role.len > platform.max_view_role_bytes) return error.ViewRoleTooLarge;
+        }
+        if (patch.command) |command| {
+            if (command.len > 0) try validateCommandName(command);
+        }
+        if (patch.url != null and !isMainWebViewLabel(label) and self.findWebViewIndex(window_id, label) == null) return error.InvalidViewOptions;
+
+        if (isMainWebViewLabel(label) or self.findWebViewIndex(window_id, label) != null) {
+            return self.updateWebViewView(window_id, label, patch);
+        }
+
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        try self.options.platform.services.updateView(window_id, label, patch);
+        if (patch.frame) |view_frame| self.views[index].frame = view_frame;
+        if (patch.layer) |layer| self.views[index].layer = layer;
+        if (patch.visible) |visible| self.views[index].visible = visible;
+        if (patch.enabled) |enabled| self.views[index].enabled = enabled;
+        if (patch.role) |role| self.views[index].role = try copyInto(&self.views[index].role_storage, role);
+        if (patch.command) |command| self.views[index].command = try copyInto(&self.views[index].command_storage, command);
+        self.invalidateFor(.command, patch.frame);
+        return self.views[index].info();
+    }
+
+    pub fn closeView(self: *Runtime, window_id: platform.WindowId, label: []const u8) anyerror!void {
+        try self.validateViewParent(window_id);
+        try validateViewLabel(label);
+        if (isMainWebViewLabel(label)) return error.InvalidViewOptions;
+
+        if (self.findWebViewIndex(window_id, label)) |webview_index| {
+            try self.options.platform.services.closeWebView(window_id, label);
+            self.removeWebViewAt(webview_index);
+            self.invalidateFor(.command, null);
+            return;
+        }
+
+        const index = self.findViewIndex(window_id, label) orelse return error.ViewNotFound;
+        try self.options.platform.services.closeView(window_id, label);
+        self.removeViewAt(index);
+        self.invalidateFor(.command, null);
+    }
+
+    pub fn listViews(self: *const Runtime, window_id: platform.WindowId, output: []platform.ViewInfo) []const platform.ViewInfo {
+        const window_index = self.findWindowIndexById(window_id) orelse return output[0..0];
+        if (!self.windows[window_index].info.open) return output[0..0];
+
+        var count: usize = 0;
+        if (count < output.len) {
+            output[count] = viewInfoFromWebView(self.mainWebViewInfo(window_index));
+            count += 1;
+        }
+        for (self.views[0..self.view_count]) |view| {
+            if (!view.open or view.window_id != window_id) continue;
+            if (count >= output.len) return output[0..count];
+            output[count] = view.info();
+            count += 1;
+        }
+        for (self.webviews[0..self.webview_count]) |webview| {
+            if (!webview.open or webview.window_id != window_id) continue;
+            if (count >= output.len) return output[0..count];
+            output[count] = viewInfoFromWebView(webview);
+            count += 1;
+        }
+        return output[0..count];
+    }
+
+    pub fn focusView(self: *Runtime, window_id: platform.WindowId, label: []const u8) anyerror!void {
+        try self.validateViewParent(window_id);
+        try validateViewLabel(label);
+        if (!self.viewLabelExists(window_id, label)) return error.ViewNotFound;
+        try self.options.platform.services.focusView(window_id, label);
+    }
+
+    pub fn openExternalUrl(self: *Runtime, url: []const u8) anyerror!void {
+        try self.validateExternalUrl(url);
+        try self.options.platform.services.openExternalUrl(url);
+    }
+
+    pub fn revealPath(self: *Runtime, path: []const u8) anyerror!void {
+        try validateRevealPath(path);
+        try self.options.platform.services.revealPath(path);
+    }
+
+    pub fn addRecentDocument(self: *Runtime, path: []const u8) anyerror!void {
+        try validateRecentDocumentPath(path);
+        try self.options.platform.services.addRecentDocument(path);
+    }
+
+    pub fn clearRecentDocuments(self: *Runtime) anyerror!void {
+        try self.options.platform.services.clearRecentDocuments();
+    }
+
+    pub fn showNotification(self: *Runtime, options: platform.NotificationOptions) anyerror!void {
+        try validateNotificationOptions(options);
+        try self.options.platform.services.showNotification(options);
+    }
+
+    pub fn setCredential(self: *Runtime, credential: platform.Credential) anyerror!void {
+        try validateCredential(credential);
+        try self.options.platform.services.setCredential(credential);
+    }
+
+    pub fn getCredential(self: *Runtime, key: platform.CredentialKey, buffer: []u8) anyerror!?[]const u8 {
+        try validateCredentialKey(key);
+        return self.options.platform.services.getCredential(key, buffer) catch |err| switch (err) {
+            error.CredentialNotFound => null,
+            else => |e| return e,
+        };
+    }
+
+    pub fn deleteCredential(self: *Runtime, key: platform.CredentialKey) anyerror!bool {
+        try validateCredentialKey(key);
+        self.options.platform.services.deleteCredential(key) catch |err| switch (err) {
+            error.CredentialNotFound => return false,
+            else => |e| return e,
+        };
+        return true;
     }
 
     pub fn emitWindowEvent(self: *Runtime, window_id: platform.WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
@@ -223,12 +493,21 @@ pub const Runtime = struct {
 
         switch (event_value) {
             .app_start => {
+                try self.reservePrimaryStartupWindow();
                 try app.start(self);
                 if (self.options.extensions) |registry| try registry.startAll(self.extensionContext());
                 try self.dispatchEvent(app, .{ .lifecycle = .start });
                 try self.loadStartupWindows(app);
                 self.invalidateFor(.startup, null);
                 try self.log("app.start", "app started", &.{trace.string("app", app.name)});
+            },
+            .app_activated => {
+                try self.dispatchEvent(app, .{ .lifecycle = .activate });
+                self.emitAppLifecycleEvent("app:activate") catch |err| try self.log("app.activate.emit_failed", @errorName(err), &.{});
+            },
+            .app_deactivated => {
+                try self.dispatchEvent(app, .{ .lifecycle = .deactivate });
+                self.emitAppLifecycleEvent("app:deactivate") catch |err| try self.log("app.deactivate.emit_failed", @errorName(err), &.{});
             },
             .surface_resized => |surface_value| {
                 self.surface = surface_value;
@@ -237,6 +516,7 @@ pub const Runtime = struct {
                     self.windows[index].info.frame.height = surface_value.size.height;
                     self.windows[index].info.scale_factor = surface_value.scale_factor;
                 }
+                self.relayoutShellViews(surface_value.id) catch |err| try self.log("shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", surface_value.id)});
                 var detail_buffer: [160]u8 = undefined;
                 var detail_writer = std.Io.Writer.fixed(&detail_buffer);
                 try detail_writer.print("{{\"width\":{d},\"height\":{d},\"scale\":{d}}}", .{
@@ -255,6 +535,7 @@ pub const Runtime = struct {
             },
             .window_frame_changed => |state| {
                 self.updateWindowState(state) catch |err| try self.log("window.state.update_failed", @errorName(err), &.{trace.string("label", state.label)});
+                self.relayoutShellViews(state.id) catch |err| try self.log("shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", state.id)});
                 if (self.options.window_state_store) |store| {
                     store.saveWindow(state) catch |err| try self.log("window.state.save_failed", @errorName(err), &.{trace.string("label", state.label)});
                 }
@@ -271,15 +552,35 @@ pub const Runtime = struct {
                 self.invalidated = true;
             },
             .frame_requested => try self.frame(app),
-            .bridge_message => |message| try self.handleBridgeMessage(message),
+            .bridge_message => |message| try self.handleBridgeMessage(app, message),
             .tray_action => |item_id| {
                 try self.log("tray.action", "tray item selected", &.{trace.uint("item_id", item_id)});
-                try self.dispatchEvent(app, .{ .command = .{ .name = "tray.action" } });
+                try self.dispatchCommand(app, .{ .name = "tray.action", .source = .tray });
             },
             .shortcut => |shortcut| {
+                try self.dispatchCommand(app, .{
+                    .name = shortcut.id,
+                    .source = .shortcut,
+                    .window_id = shortcut.window_id,
+                });
                 try self.dispatchEvent(app, .{ .shortcut = shortcut });
                 self.emitShortcutEvent(shortcut) catch |err| try self.log("shortcut.emit_failed", @errorName(err), &.{trace.string("id", shortcut.id)});
                 self.invalidateFor(.command, null);
+            },
+            .native_command => |command| {
+                try self.dispatchCommand(app, .{
+                    .name = command.name,
+                    .source = self.commandSourceForNativeView(command.window_id, command.view_label),
+                    .window_id = command.window_id,
+                    .view_label = command.view_label,
+                });
+            },
+            .menu_command => |command| {
+                try self.dispatchCommand(app, .{
+                    .name = command.name,
+                    .source = .menu,
+                    .window_id = command.window_id,
+                });
             },
             .app_shutdown => {
                 try self.dispatchEvent(app, .{ .lifecycle = .stop });
@@ -307,6 +608,11 @@ pub const Runtime = struct {
             },
             .lifecycle => {},
         }
+    }
+
+    pub fn dispatchCommand(self: *Runtime, app: App, command: CommandEvent) anyerror!void {
+        try validateCommandName(command.name);
+        try self.dispatchEvent(app, .{ .command = command });
     }
 
     pub fn frame(self: *Runtime, app: App) anyerror!void {
@@ -339,10 +645,12 @@ pub const Runtime = struct {
             self.automation_windows[0] = .{ .id = 1, .title = title, .bounds = geometry.RectF.fromSize(self.surface.size), .focused = true };
             return .{
                 .windows = self.automation_windows[0..1],
+                .views = &.{},
                 .diagnostics = .{ .frame_index = self.last_diagnostics.frame_index, .command_count = self.last_diagnostics.command_count },
                 .source = self.loaded_source,
             };
         }
+        var view_count: usize = 0;
         for (self.windows[0..count], 0..) |window, index| {
             self.automation_windows[index] = .{
                 .id = window.info.id,
@@ -350,9 +658,14 @@ pub const Runtime = struct {
                 .bounds = window.info.frame,
                 .focused = window.info.focused,
             };
+            if (view_count < self.automation_views.len) {
+                const views = self.listViews(window.info.id, self.automation_views[view_count..]);
+                view_count += views.len;
+            }
         }
         return .{
             .windows = self.automation_windows[0..count],
+            .views = self.automation_views[0..view_count],
             .diagnostics = .{ .frame_index = self.last_diagnostics.frame_index, .command_count = self.last_diagnostics.command_count },
             .source = self.loaded_source,
         };
@@ -375,7 +688,9 @@ pub const Runtime = struct {
         var index: usize = 0;
         while (index < count) : (index += 1) {
             const window = app_info.resolvedStartupWindow(index);
-            if (self.findWindowIndexById(window.id) == null) {
+            if (self.findWindowIndexById(window.id)) |runtime_index| {
+                self.windows[runtime_index].source = try self.copySource(runtime_index, source);
+            } else {
                 const runtime_index = try self.reserveWindow(window.id, window.label, window.resolvedTitle(app_info.app_name), source);
                 self.windows[runtime_index].info.frame = window.default_frame;
                 self.windows[runtime_index].main_frame = geometry.RectF.init(0, 0, window.default_frame.width, window.default_frame.height);
@@ -384,12 +699,27 @@ pub const Runtime = struct {
                 _ = try self.options.platform.services.createWindow(window);
             }
             try self.options.platform.services.loadWindowWebView(window.id, source);
+            try self.applyMainWebViewState(window.id);
             self.next_window_id = @max(self.next_window_id, window.id + 1);
         }
         try self.log("webview.load", "loaded webview source", &.{
             trace.string("kind", @tagName(source.kind)),
             trace.uint("bytes", source.bytes.len),
         });
+    }
+
+    fn applyMainWebViewState(self: *Runtime, window_id: platform.WindowId) anyerror!void {
+        const window_index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+        const window = self.windows[window_index];
+        if (window.main_frame_set) {
+            try self.options.platform.services.setWebViewFrame(window_id, "main", window.main_frame);
+        }
+        if (window.main_layer != 0) {
+            try self.options.platform.services.setWebViewLayer(window_id, "main", window.main_layer);
+        }
+        if (window.main_zoom != 1.0) {
+            try self.options.platform.services.setWebViewZoom(window_id, "main", window.main_zoom);
+        }
     }
 
     fn loadWebView(self: *Runtime, app: App) anyerror!void {
@@ -411,9 +741,9 @@ pub const Runtime = struct {
         }
     }
 
-    fn handleBridgeMessage(self: *Runtime, message: platform.BridgeMessage) anyerror!void {
+    fn handleBridgeMessage(self: *Runtime, app: App, message: platform.BridgeMessage) anyerror!void {
         self.command_count += 1;
-        if (try self.handleBuiltinBridgeMessage(message)) return;
+        if (try self.handleBuiltinBridgeMessage(app, message)) return;
         var dispatcher = self.options.bridge orelse bridge.Dispatcher{};
         if (self.options.security.permissions.len > 0) dispatcher.policy.permissions = self.options.security.permissions;
         var response_buffer: [bridge.max_response_bytes]u8 = undefined;
@@ -492,7 +822,7 @@ pub const Runtime = struct {
                 self.invalidateFor(.command, null);
             },
             .bridge => {
-                try self.handleBridgeMessage(.{ .bytes = command.value, .origin = "zero://inline", .window_id = 1, .webview_label = "main" });
+                try self.handleBridgeMessage(app, .{ .bytes = command.value, .origin = "zero://inline", .window_id = 1, .webview_label = "main" });
             },
             .wait => {},
         }
@@ -524,6 +854,7 @@ pub const Runtime = struct {
 
     fn removeWindowAt(self: *Runtime, index: usize) void {
         if (index >= self.window_count) return;
+        self.removeShellLayoutForWindow(self.windows[index].info.id);
         var cursor = index;
         while (cursor + 1 < self.window_count) : (cursor += 1) {
             self.windows[cursor] = self.windows[cursor + 1];
@@ -567,6 +898,46 @@ pub const Runtime = struct {
         if (state.focused) self.setFocusedIndex(index);
     }
 
+    fn shellBoundsForWindow(self: *const Runtime, window_id: platform.WindowId) geometry.RectF {
+        const index = self.findWindowIndexById(window_id) orelse return geometry.RectF.init(0, 0, 0, 0);
+        const frame_value = self.windows[index].info.frame;
+        return geometry.RectF.init(0, 0, frame_value.width, frame_value.height);
+    }
+
+    fn bindShellViews(self: *Runtime, window_id: platform.WindowId, views: []const app_manifest.ShellView) !void {
+        if (self.findShellLayoutIndex(window_id)) |index| {
+            self.shell_layouts[index].views = views;
+            return;
+        }
+        if (self.shell_layout_count >= self.shell_layouts.len) return error.WindowLimitReached;
+        self.shell_layouts[self.shell_layout_count] = .{
+            .window_id = window_id,
+            .views = views,
+        };
+        self.shell_layout_count += 1;
+    }
+
+    fn shellLayoutForWindow(self: *const Runtime, window_id: platform.WindowId) ?RuntimeShellLayout {
+        const index = self.findShellLayoutIndex(window_id) orelse return null;
+        return self.shell_layouts[index];
+    }
+
+    fn findShellLayoutIndex(self: *const Runtime, window_id: platform.WindowId) ?usize {
+        for (self.shell_layouts[0..self.shell_layout_count], 0..) |layout, index| {
+            if (layout.window_id == window_id) return index;
+        }
+        return null;
+    }
+
+    fn removeShellLayoutForWindow(self: *Runtime, window_id: platform.WindowId) void {
+        const index = self.findShellLayoutIndex(window_id) orelse return;
+        var cursor = index;
+        while (cursor + 1 < self.shell_layout_count) : (cursor += 1) {
+            self.shell_layouts[cursor] = self.shell_layouts[cursor + 1];
+        }
+        self.shell_layout_count -= 1;
+    }
+
     fn setFocusedIndex(self: *Runtime, focused_index: usize) void {
         for (self.windows[0..self.window_count], 0..) |*window, index| {
             window.info.focused = index == focused_index;
@@ -594,20 +965,32 @@ pub const Runtime = struct {
         return id;
     }
 
-    fn handleBuiltinBridgeMessage(self: *Runtime, message: platform.BridgeMessage) anyerror!bool {
+    fn handleBuiltinBridgeMessage(self: *Runtime, app: App, message: platform.BridgeMessage) anyerror!bool {
         const request = bridge.parseRequest(message.bytes) catch return false;
+        const is_command = std.mem.startsWith(u8, request.command, "zero-native.command.");
         const is_window = std.mem.startsWith(u8, request.command, "zero-native.window.");
+        const is_view = std.mem.startsWith(u8, request.command, "zero-native.view.");
         const is_webview = std.mem.startsWith(u8, request.command, "zero-native.webview.");
         const is_dialog = std.mem.startsWith(u8, request.command, "zero-native.dialog.");
-        if (!is_window and !is_webview and !is_dialog) return false;
+        const is_os = std.mem.startsWith(u8, request.command, "zero-native.os.");
+        const is_credentials = std.mem.startsWith(u8, request.command, "zero-native.credentials.");
+        if (!is_command and !is_window and !is_view and !is_webview and !is_dialog and !is_os and !is_credentials) return false;
 
         var response_buffer: [bridge.max_response_bytes]u8 = undefined;
         var result_buffer: [bridge.max_result_bytes]u8 = undefined;
-        if (!self.allowsBuiltinBridgeCommand(request.command, message.origin, is_window or is_webview)) {
-            const message_text = if (is_webview)
+        if (!self.allowsBuiltinBridgeCommand(request.command, message.origin, is_command or is_window or is_view or is_webview)) {
+            const message_text = if (is_view)
+                "View API is not permitted"
+            else if (is_webview)
                 "WebView API is not permitted"
             else if (is_window)
                 "Window API is not permitted"
+            else if (is_command)
+                "Command API is not permitted"
+            else if (is_os)
+                "OS API is not permitted"
+            else if (is_credentials)
+                "Credentials API is not permitted"
             else
                 "Dialog API is not permitted";
             const result = bridge.writeErrorResponse(&response_buffer, request.id, .permission_denied, message_text);
@@ -615,12 +998,20 @@ pub const Runtime = struct {
             self.invalidateFor(.command, null);
             return true;
         }
-        const result = if (is_window)
+        const result = if (is_command)
+            self.dispatchCommandBridgeCommand(app, request, message.window_id, message.webview_label, &result_buffer, &response_buffer)
+        else if (is_window)
             self.dispatchWindowBridgeCommand(request, &result_buffer, &response_buffer)
+        else if (is_view)
+            self.dispatchViewBridgeCommand(request, message.window_id, &result_buffer, &response_buffer)
         else if (is_webview)
             self.dispatchWebViewBridgeCommand(request, message.window_id, &result_buffer, &response_buffer)
+        else if (is_dialog)
+            self.dispatchDialogBridgeCommand(request, &result_buffer, &response_buffer)
+        else if (is_credentials)
+            self.dispatchCredentialBridgeCommand(request, &result_buffer, &response_buffer)
         else
-            self.dispatchDialogBridgeCommand(request, &result_buffer, &response_buffer);
+            self.dispatchOsBridgeCommand(request, &result_buffer, &response_buffer);
 
         try self.completeBridgeResponse(message.window_id, message.webview_label, result);
         self.invalidateFor(.command, null);
@@ -654,6 +1045,12 @@ pub const Runtime = struct {
         try self.emitWindowEvent(shortcut.window_id, "shortcut", writer.buffered());
     }
 
+    fn emitAppLifecycleEvent(self: *Runtime, name: []const u8) anyerror!void {
+        for (self.windows[0..self.window_count]) |window| {
+            if (window.info.open) try self.emitWindowEvent(window.info.id, name, "{}");
+        }
+    }
+
     fn allowsBuiltinBridgeCommand(self: *Runtime, command: []const u8, origin: []const u8, uses_window_permission: bool) bool {
         var policy = self.options.builtin_bridge;
         if (self.options.security.permissions.len > 0) policy.permissions = self.options.security.permissions;
@@ -662,6 +1059,14 @@ pub const Runtime = struct {
         if (!security.allowsOrigin(self.options.security.navigation.allowed_origins, origin)) return false;
         if (self.options.security.permissions.len == 0) return true;
         return security.hasPermission(self.options.security.permissions, security.permission_window);
+    }
+
+    fn dispatchCommandBridgeCommand(self: *Runtime, app: App, request: bridge.Request, source_window_id: platform.WindowId, source_view_label: []const u8, result_buffer: []u8, response_buffer: []u8) []const u8 {
+        const result = if (std.mem.eql(u8, request.command, "zero-native.command.invoke"))
+            self.invokeCommandFromJson(app, request.payload, source_window_id, source_view_label, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else
+            return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown command command");
+        return bridge.writeSuccessResponse(response_buffer, request.id, result);
     }
 
     fn dispatchWindowBridgeCommand(self: *Runtime, request: bridge.Request, result_buffer: []u8, response_buffer: []u8) []const u8 {
@@ -675,6 +1080,41 @@ pub const Runtime = struct {
             self.closeWindowFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, .internal_error, builtinBridgeErrorMessage(err))
         else
             return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown window command");
+        return bridge.writeSuccessResponse(response_buffer, request.id, result);
+    }
+
+    fn invokeCommandFromJson(self: *Runtime, app: App, payload: []const u8, source_window_id: platform.WindowId, source_view_label: []const u8, output: []u8) ![]const u8 {
+        var scratch: [max_command_id_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const name = jsonStringField(payload, "name", &storage) orelse jsonStringField(payload, "id", &storage) orelse return error.InvalidCommand;
+        const view_label = if (std.mem.eql(u8, source_view_label, "main")) "" else source_view_label;
+        const event: CommandEvent = .{
+            .name = name,
+            .source = .bridge,
+            .window_id = source_window_id,
+            .view_label = view_label,
+        };
+        try self.dispatchCommand(app, event);
+        return writeCommandEventJson(event, output);
+    }
+
+    fn dispatchViewBridgeCommand(self: *Runtime, request: bridge.Request, source_window_id: platform.WindowId, result_buffer: []u8, response_buffer: []u8) []const u8 {
+        const result = if (std.mem.eql(u8, request.command, "zero-native.view.create"))
+            self.createViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.list"))
+            self.writeViewListJson(source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.update"))
+            self.updateViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.setFrame"))
+            self.setViewFrameFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.setVisible"))
+            self.setViewVisibleFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.focus"))
+            self.focusViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.view.close"))
+            self.closeViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else
+            return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown view command");
         return bridge.writeSuccessResponse(response_buffer, request.id, result);
     }
 
@@ -708,6 +1148,106 @@ pub const Runtime = struct {
         else
             return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown dialog command");
         return bridge.writeSuccessResponse(response_buffer, request.id, result);
+    }
+
+    fn dispatchOsBridgeCommand(self: *Runtime, request: bridge.Request, result_buffer: []u8, response_buffer: []u8) []const u8 {
+        const result = if (std.mem.eql(u8, request.command, "zero-native.os.openUrl"))
+            self.openExternalUrlFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.os.showNotification"))
+            self.showNotificationFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.os.revealPath"))
+            self.revealPathFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.os.addRecentDocument"))
+            self.addRecentDocumentFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.os.clearRecentDocuments"))
+            self.clearRecentDocumentsFromJson(result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else
+            return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown OS command");
+        return bridge.writeSuccessResponse(response_buffer, request.id, result);
+    }
+
+    fn dispatchCredentialBridgeCommand(self: *Runtime, request: bridge.Request, result_buffer: []u8, response_buffer: []u8) []const u8 {
+        const result = if (std.mem.eql(u8, request.command, "zero-native.credentials.set"))
+            self.setCredentialFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.credentials.get"))
+            self.getCredentialFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.credentials.delete"))
+            self.deleteCredentialFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else
+            return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown credentials command");
+        return bridge.writeSuccessResponse(response_buffer, request.id, result);
+    }
+
+    fn setCredentialFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const service = jsonStringField(payload, "service", &storage) orelse return error.InvalidCredentialOptions;
+        const account = jsonStringField(payload, "account", &storage) orelse return error.InvalidCredentialOptions;
+        const secret = jsonStringField(payload, "secret", &storage) orelse jsonStringField(payload, "value", &storage) orelse return error.InvalidCredentialOptions;
+        try self.setCredential(.{ .service = service, .account = account, .secret = secret });
+        return writeTrueJson(output);
+    }
+
+    fn getCredentialFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const service = jsonStringField(payload, "service", &storage) orelse return error.InvalidCredentialOptions;
+        const account = jsonStringField(payload, "account", &storage) orelse return error.InvalidCredentialOptions;
+        var secret_buffer: [platform.max_credential_secret_bytes]u8 = undefined;
+        const secret = try self.getCredential(.{ .service = service, .account = account }, &secret_buffer);
+        var writer = std.Io.Writer.fixed(output);
+        if (secret) |value| {
+            try json.writeString(&writer, value);
+        } else {
+            try writer.writeAll("null");
+        }
+        return writer.buffered();
+    }
+
+    fn deleteCredentialFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const service = jsonStringField(payload, "service", &storage) orelse return error.InvalidCredentialOptions;
+        const account = jsonStringField(payload, "account", &storage) orelse return error.InvalidCredentialOptions;
+        var writer = std.Io.Writer.fixed(output);
+        try writer.writeAll(if (try self.deleteCredential(.{ .service = service, .account = account })) "true" else "false");
+        return writer.buffered();
+    }
+
+    fn showNotificationFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const title = jsonStringField(payload, "title", &storage) orelse return error.InvalidNotificationOptions;
+        const subtitle = jsonStringField(payload, "subtitle", &storage) orelse "";
+        const body = jsonStringField(payload, "body", &storage) orelse jsonStringField(payload, "message", &storage) orelse "";
+        try self.showNotification(.{
+            .title = title,
+            .subtitle = subtitle,
+            .body = body,
+        });
+        return writeTrueJson(output);
+    }
+
+    fn openExternalUrlFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const url = jsonStringField(payload, "url", &storage) orelse return error.InvalidExternalUrl;
+        try self.openExternalUrl(url);
+        return writeTrueJson(output);
+    }
+
+    fn revealPathFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const path = jsonStringField(payload, "path", &storage) orelse return error.InvalidRevealPath;
+        try self.revealPath(path);
+        return writeTrueJson(output);
+    }
+
+    fn addRecentDocumentFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
+        var storage = json.StringStorage.init(output);
+        const path = jsonStringField(payload, "path", &storage) orelse return error.InvalidRecentDocumentPath;
+        try self.addRecentDocument(path);
+        return writeTrueJson(output);
+    }
+
+    fn clearRecentDocumentsFromJson(self: *Runtime, output: []u8) ![]const u8 {
+        try self.clearRecentDocuments();
+        return writeTrueJson(output);
     }
 
     fn openFileDialogFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
@@ -817,6 +1357,117 @@ pub const Runtime = struct {
             .source = source,
         });
         return writeWindowJson(info, output);
+    }
+
+    fn createViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes * 2 + platform.max_view_role_bytes + platform.max_view_command_bytes + platform.max_webview_url_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const kind_str = jsonStringField(payload, "kind", &storage) orelse return error.InvalidViewOptions;
+        const kind = viewKindFromString(kind_str) orelse return error.UnsupportedViewKind;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        const role = jsonStringField(payload, "role", &storage) orelse "";
+        const command = jsonStringField(payload, "command", &storage) orelse "";
+        const parent = jsonStringField(payload, "parent", &storage);
+        const url = jsonStringField(payload, "url", &storage) orelse "";
+        const info = try self.createView(.{
+            .window_id = window_id,
+            .label = label,
+            .kind = kind,
+            .parent = parent,
+            .frame = (try viewFrameFromJson(payload, kind == .webview)) orelse geometry.RectF.init(0, 0, 0, 0),
+            .layer = try viewLayerFromJson(payload) orelse 0,
+            .visible = jsonBoolField(payload, "visible") orelse true,
+            .enabled = jsonBoolField(payload, "enabled") orelse true,
+            .role = role,
+            .command = command,
+            .url = url,
+            .transparent = jsonBoolField(payload, "transparent") orelse false,
+            .bridge_enabled = jsonBoolField(payload, "bridge") orelse false,
+        });
+        return writeViewJson(info, output);
+    }
+
+    fn updateViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes + platform.max_view_role_bytes + platform.max_view_command_bytes + platform.max_webview_url_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        const patch: platform.ViewPatch = .{
+            .frame = try viewFrameFromJson(payload, false),
+            .layer = try viewLayerFromJson(payload),
+            .visible = jsonBoolField(payload, "visible"),
+            .enabled = jsonBoolField(payload, "enabled"),
+            .role = jsonStringField(payload, "role", &storage),
+            .command = jsonStringField(payload, "command", &storage),
+            .url = jsonStringField(payload, "url", &storage),
+        };
+        const info = try self.updateView(window_id, label, patch);
+        return writeViewJson(info, output);
+    }
+
+    fn setViewFrameFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        const info = try self.updateView(window_id, label, .{ .frame = try viewFrameFromJson(payload, true) });
+        return writeViewJson(info, output);
+    }
+
+    fn setViewVisibleFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const visible = jsonBoolField(payload, "visible") orelse return error.InvalidViewOptions;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        const info = try self.updateView(window_id, label, .{ .visible = visible });
+        return writeViewJson(info, output);
+    }
+
+    fn focusViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        try self.focusView(window_id, label);
+        var views_buffer: [platform.max_views + platform.max_webviews + 1]platform.ViewInfo = undefined;
+        for (self.listViews(window_id, &views_buffer)) |view| {
+            if (std.mem.eql(u8, view.label, label)) return writeViewJson(view, output);
+        }
+        return error.ViewNotFound;
+    }
+
+    fn closeViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_view_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse return error.InvalidViewOptions;
+        const window_id = try viewWindowIdFromJson(payload, source_window_id);
+        var views_buffer: [platform.max_views + platform.max_webviews + 1]platform.ViewInfo = undefined;
+        for (self.listViews(window_id, &views_buffer)) |view| {
+            if (std.mem.eql(u8, view.label, label)) {
+                var closed = view;
+                closed.open = false;
+                const result = try writeViewJson(closed, output);
+                try self.closeView(window_id, label);
+                return result;
+            }
+        }
+        return error.ViewNotFound;
+    }
+
+    fn writeViewListJson(self: *Runtime, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        try self.validateViewParent(source_window_id);
+        var views_buffer: [platform.max_views + platform.max_webviews + 1]platform.ViewInfo = undefined;
+        const views = self.listViews(source_window_id, &views_buffer);
+        var writer = std.Io.Writer.fixed(output);
+        try writer.writeByte('[');
+        for (views, 0..) |view, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writeViewJsonToWriter(view, &writer);
+        }
+        try writer.writeByte(']');
+        return writer.buffered();
     }
 
     fn createWebViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
@@ -964,6 +1615,16 @@ pub const Runtime = struct {
         if (!security.allowsOrigin(self.options.security.navigation.allowed_origins, origin)) return error.NavigationDenied;
     }
 
+    fn validateExternalUrl(self: *Runtime, url: []const u8) !void {
+        if (url.len == 0) return error.InvalidExternalUrl;
+        if (url.len > platform.max_external_url_bytes) return error.ExternalUrlTooLarge;
+        if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://")) return error.InvalidExternalUrl;
+        for (url) |ch| {
+            if (ch <= 0x20 or ch == 0x7f) return error.InvalidExternalUrl;
+        }
+        if (!security.allowsExternalUrl(self.options.security.navigation.external_links, url)) return error.NavigationDenied;
+    }
+
     fn writeWebViewListJson(self: *Runtime, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
         try self.validateWebViewParent(source_window_id);
         var writer = std.Io.Writer.fixed(output);
@@ -1048,6 +1709,149 @@ pub const Runtime = struct {
             .bridge_enabled = true,
             .open = window.info.open,
         };
+    }
+
+    fn createWebViewView(self: *Runtime, options: platform.ViewOptions) !platform.ViewInfo {
+        try validateChildWebViewLabel(options.label);
+        try self.validateWebViewUrl(options.url);
+        if (!isValidWebViewFrame(options.frame)) return error.InvalidWebViewOptions;
+        if (self.webview_count >= platform.max_webviews) return error.WebViewLimitReached;
+        try self.options.platform.services.createView(options);
+        var reserved = false;
+        errdefer {
+            if (reserved) {
+                if (self.findWebViewIndex(options.window_id, options.label)) |index| self.removeWebViewAt(index);
+            }
+            self.options.platform.services.closeView(options.window_id, options.label) catch {};
+        }
+        try self.reserveWebView(options.window_id, options.label, options.url, options.frame, options.layer, options.transparent, options.bridge_enabled);
+        reserved = true;
+        self.invalidateFor(.command, options.frame);
+        return viewInfoFromWebView(self.webviews[self.webview_count - 1]);
+    }
+
+    fn updateWebViewView(self: *Runtime, window_id: platform.WindowId, label: []const u8, patch: platform.ViewPatch) !platform.ViewInfo {
+        if (patch.visible != null or patch.enabled != null or patch.role != null or patch.command != null) return error.InvalidViewOptions;
+        if (isMainWebViewLabel(label)) {
+            const window_index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+            if (patch.url != null) return error.InvalidViewOptions;
+            if (patch.frame) |view_frame| {
+                if (!isValidWebViewFrame(view_frame)) return error.InvalidWebViewOptions;
+                if (self.windows[window_index].source != null) {
+                    try self.options.platform.services.setWebViewFrame(window_id, label, view_frame);
+                }
+                self.windows[window_index].main_frame = view_frame;
+                self.windows[window_index].main_frame_set = true;
+            }
+            if (patch.layer) |layer| {
+                if (self.windows[window_index].source != null) {
+                    try self.options.platform.services.setWebViewLayer(window_id, label, layer);
+                }
+                self.windows[window_index].main_layer = layer;
+            }
+            self.invalidateFor(.command, patch.frame);
+            return viewInfoFromWebView(self.mainWebViewInfo(window_index));
+        }
+
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        if (patch.frame) |view_frame| {
+            if (!isValidWebViewFrame(view_frame)) return error.InvalidWebViewOptions;
+            try self.options.platform.services.setWebViewFrame(window_id, label, view_frame);
+            self.webviews[webview_index].frame = view_frame;
+        }
+        if (patch.layer) |layer| {
+            try self.options.platform.services.setWebViewLayer(window_id, label, layer);
+            self.webviews[webview_index].layer = layer;
+        }
+        if (patch.url) |url| {
+            try self.validateWebViewUrl(url);
+            try self.options.platform.services.navigateWebView(window_id, label, url);
+            self.webviews[webview_index].url = try copyInto(&self.webviews[webview_index].url_storage, url);
+        }
+        self.invalidateFor(.command, patch.frame);
+        return viewInfoFromWebView(self.webviews[webview_index]);
+    }
+
+    fn validateViewParent(self: *const Runtime, window_id: platform.WindowId) !void {
+        const index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+        if (!self.windows[index].info.open) return error.WindowNotFound;
+    }
+
+    fn reserveView(self: *Runtime, options: platform.ViewOptions) !void {
+        const index = self.view_count;
+        self.views[index] = .{
+            .window_id = options.window_id,
+            .kind = options.kind,
+            .frame = options.frame,
+            .layer = options.layer,
+            .visible = options.visible,
+            .enabled = options.enabled,
+            .transparent = options.transparent,
+            .bridge_enabled = options.bridge_enabled,
+            .open = true,
+        };
+        self.views[index].label = try copyInto(&self.views[index].label_storage, options.label);
+        self.views[index].parent = if (options.parent) |parent| try copyInto(&self.views[index].parent_storage, parent) else null;
+        self.views[index].role = try copyInto(&self.views[index].role_storage, options.role);
+        self.views[index].command = try copyInto(&self.views[index].command_storage, options.command);
+        self.view_count += 1;
+    }
+
+    fn findViewIndex(self: *const Runtime, window_id: platform.WindowId, label: []const u8) ?usize {
+        for (self.views[0..self.view_count], 0..) |view, index| {
+            if (view.open and view.window_id == window_id and std.mem.eql(u8, view.label, label)) return index;
+        }
+        return null;
+    }
+
+    fn commandSourceForNativeView(self: *const Runtime, window_id: platform.WindowId, label: []const u8) CommandSource {
+        const index = self.findViewIndex(window_id, label) orelse return .native_view;
+        const view = self.views[index];
+        if (view.kind == .toolbar) return .toolbar;
+        const parent_label = view.parent orelse return .native_view;
+        const parent_index = self.findViewIndex(window_id, parent_label) orelse return .native_view;
+        if (self.views[parent_index].kind == .toolbar) return .toolbar;
+        return .native_view;
+    }
+
+    fn viewLabelExists(self: *const Runtime, window_id: platform.WindowId, label: []const u8) bool {
+        if (isMainWebViewLabel(label) and self.findWindowIndexById(window_id) != null) return true;
+        return self.findViewIndex(window_id, label) != null or self.findWebViewIndex(window_id, label) != null;
+    }
+
+    fn removeViewAt(self: *Runtime, index: usize) void {
+        if (index >= self.view_count) return;
+        var cursor = index;
+        while (cursor + 1 < self.view_count) : (cursor += 1) {
+            const next = self.views[cursor + 1];
+            self.views[cursor] = .{
+                .window_id = next.window_id,
+                .kind = next.kind,
+                .frame = next.frame,
+                .layer = next.layer,
+                .visible = next.visible,
+                .enabled = next.enabled,
+                .transparent = next.transparent,
+                .bridge_enabled = next.bridge_enabled,
+                .open = next.open,
+            };
+            self.views[cursor].label = copyInto(&self.views[cursor].label_storage, next.label) catch unreachable;
+            self.views[cursor].parent = if (next.parent) |parent| copyInto(&self.views[cursor].parent_storage, parent) catch unreachable else null;
+            self.views[cursor].role = copyInto(&self.views[cursor].role_storage, next.role) catch unreachable;
+            self.views[cursor].command = copyInto(&self.views[cursor].command_storage, next.command) catch unreachable;
+        }
+        self.view_count -= 1;
+    }
+
+    fn removeViewsForWindow(self: *Runtime, window_id: platform.WindowId) void {
+        var index: usize = 0;
+        while (index < self.view_count) {
+            if (self.views[index].window_id == window_id) {
+                self.removeViewAt(index);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn focusWindowFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
@@ -1149,6 +1953,290 @@ const RuntimeWebView = struct {
     url_storage: [platform.max_webview_url_bytes]u8 = undefined,
 };
 
+const RuntimeShellLayout = struct {
+    window_id: platform.WindowId = 1,
+    views: []const app_manifest.ShellView = &.{},
+};
+
+const ShellApplyMode = enum {
+    create,
+    update,
+};
+
+const RuntimeView = struct {
+    window_id: platform.WindowId = 1,
+    label: []const u8 = "",
+    kind: platform.ViewKind = .toolbar,
+    parent: ?[]const u8 = null,
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: []const u8 = "",
+    command: []const u8 = "",
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+    open: bool = false,
+    label_storage: [platform.max_view_label_bytes]u8 = undefined,
+    parent_storage: [platform.max_view_label_bytes]u8 = undefined,
+    role_storage: [platform.max_view_role_bytes]u8 = undefined,
+    command_storage: [platform.max_view_command_bytes]u8 = undefined,
+
+    fn info(self: RuntimeView) platform.ViewInfo {
+        return .{
+            .window_id = self.window_id,
+            .label = self.label,
+            .kind = self.kind,
+            .parent = self.parent,
+            .frame = self.frame,
+            .layer = self.layer,
+            .visible = self.visible,
+            .enabled = self.enabled,
+            .role = self.role,
+            .command = self.command,
+            .url = "",
+            .transparent = self.transparent,
+            .bridge_enabled = self.bridge_enabled,
+            .open = self.open,
+        };
+    }
+};
+
+const ShellResolvedView = struct {
+    label: []const u8 = "",
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+};
+
+const ShellParentCursor = struct {
+    label: []const u8 = "",
+    x: f32 = 8,
+};
+
+const ShellLayout = struct {
+    remaining: geometry.RectF,
+    fill_rect: geometry.RectF,
+    views: [app_manifest.max_shell_views_per_window]ShellResolvedView = undefined,
+    view_count: usize = 0,
+    parent_cursors: [app_manifest.max_shell_views_per_window]ShellParentCursor = undefined,
+    parent_cursor_count: usize = 0,
+
+    fn init(window_frame: geometry.RectF, views: []const app_manifest.ShellView) ShellLayout {
+        const base = geometry.RectF.init(0, 0, window_frame.width, window_frame.height);
+        var fill_rect = base;
+        for (views) |view| {
+            if (view.parent != null or view.fill) continue;
+            const edge = view.edge orelse continue;
+            const frame = dockedShellFrame(fill_rect, view, edge);
+            consumeShellRect(&fill_rect, edge, frame);
+        }
+        return .{
+            .remaining = base,
+            .fill_rect = fill_rect,
+        };
+    }
+
+    fn frameFor(self: *ShellLayout, view: app_manifest.ShellView) !geometry.RectF {
+        const frame = if (view.parent != null)
+            try self.parentedFrame(view)
+        else if (view.fill)
+            self.fillFrame(view)
+        else if (view.edge) |edge|
+            self.dockedFrame(view, edge)
+        else
+            explicitShellFrame(view);
+        try self.recordView(view.label, frame);
+        return frame;
+    }
+
+    fn parentedFrame(self: *ShellLayout, view: app_manifest.ShellView) !geometry.RectF {
+        const parent_label = view.parent orelse return error.InvalidViewOptions;
+        const parent = self.findView(parent_label) orelse return error.InvalidViewOptions;
+        const width = view.width orelse defaultShellViewWidth(view.kind);
+        const height = view.height orelse defaultShellViewHeight(view.kind, parent.frame.height);
+        const cursor = self.parentCursor(parent_label);
+        const x = view.x orelse cursor.x;
+        const y = view.y orelse centeredOffset(parent.frame.height, height);
+        if (view.x == null) cursor.x = x + width + 8;
+        return geometry.RectF.init(x, y, width, height);
+    }
+
+    fn fillFrame(self: *ShellLayout, view: app_manifest.ShellView) geometry.RectF {
+        return geometry.RectF.init(
+            view.x orelse self.fill_rect.x,
+            view.y orelse self.fill_rect.y,
+            view.width orelse self.fill_rect.width,
+            view.height orelse self.fill_rect.height,
+        );
+    }
+
+    fn dockedFrame(self: *ShellLayout, view: app_manifest.ShellView, edge: app_manifest.ShellEdge) geometry.RectF {
+        const frame = dockedShellFrame(self.remaining, view, edge);
+        consumeShellRect(&self.remaining, edge, frame);
+        return frame;
+    }
+
+    fn recordView(self: *ShellLayout, label: []const u8, frame: geometry.RectF) !void {
+        if (self.view_count >= self.views.len) return error.ViewLimitReached;
+        self.views[self.view_count] = .{ .label = label, .frame = frame };
+        self.view_count += 1;
+    }
+
+    fn findView(self: *const ShellLayout, label: []const u8) ?ShellResolvedView {
+        for (self.views[0..self.view_count]) |view| {
+            if (std.mem.eql(u8, view.label, label)) return view;
+        }
+        return null;
+    }
+
+    fn parentCursor(self: *ShellLayout, label: []const u8) *ShellParentCursor {
+        for (self.parent_cursors[0..self.parent_cursor_count]) |*cursor| {
+            if (std.mem.eql(u8, cursor.label, label)) return cursor;
+        }
+        const index = self.parent_cursor_count;
+        self.parent_cursors[index] = .{ .label = label };
+        self.parent_cursor_count += 1;
+        return &self.parent_cursors[index];
+    }
+};
+
+fn shellRestorePolicy(policy: app_manifest.WindowRestorePolicy) platform.WindowRestorePolicy {
+    return switch (policy) {
+        .clamp_to_visible_screen => .clamp_to_visible_screen,
+        .center_on_primary => .center_on_primary,
+    };
+}
+
+fn shellViewOptions(window_id: platform.WindowId, view: app_manifest.ShellView, layout: *ShellLayout) !platform.ViewOptions {
+    return .{
+        .window_id = window_id,
+        .label = view.label,
+        .kind = shellViewKind(view.kind),
+        .parent = view.parent,
+        .frame = try layout.frameFor(view),
+        .layer = view.layer,
+        .visible = view.visible,
+        .enabled = view.enabled,
+        .role = view.role orelse view.text orelse "",
+        .command = view.command orelse "",
+        .url = view.url orelse "",
+        .bridge_enabled = view.kind == .webview,
+    };
+}
+
+fn shellViewKind(kind: app_manifest.ViewKind) platform.ViewKind {
+    return switch (kind) {
+        .webview => .webview,
+        .toolbar => .toolbar,
+        .titlebar_accessory => .titlebar_accessory,
+        .sidebar => .sidebar,
+        .statusbar => .statusbar,
+        .split => .split,
+        .stack => .stack,
+        .button => .button,
+        .checkbox => .checkbox,
+        .toggle => .toggle,
+        .text_field => .text_field,
+        .search_field => .search_field,
+        .label => .label,
+        .spacer => .spacer,
+        .gpu_surface => .gpu_surface,
+    };
+}
+
+fn explicitShellFrame(view: app_manifest.ShellView) geometry.RectF {
+    return geometry.RectF.init(
+        view.x orelse 0,
+        view.y orelse 0,
+        view.width orelse defaultShellViewWidth(view.kind),
+        view.height orelse defaultShellViewHeight(view.kind, 0),
+    );
+}
+
+fn dockedShellFrame(remaining: geometry.RectF, view: app_manifest.ShellView, edge: app_manifest.ShellEdge) geometry.RectF {
+    return switch (edge) {
+        .top => frame: {
+            const height = view.height orelse defaultDockHeight(view.kind);
+            break :frame geometry.RectF.init(remaining.x, remaining.y, view.width orelse remaining.width, height);
+        },
+        .bottom => frame: {
+            const height = view.height orelse defaultDockHeight(view.kind);
+            break :frame geometry.RectF.init(remaining.x, remaining.y + @max(remaining.height - height, 0), view.width orelse remaining.width, height);
+        },
+        .left => frame: {
+            const width = view.width orelse defaultDockWidth(view.kind);
+            break :frame geometry.RectF.init(remaining.x, remaining.y, width, view.height orelse remaining.height);
+        },
+        .right => frame: {
+            const width = view.width orelse defaultDockWidth(view.kind);
+            break :frame geometry.RectF.init(remaining.x + @max(remaining.width - width, 0), remaining.y, width, view.height orelse remaining.height);
+        },
+    };
+}
+
+fn consumeShellRect(remaining: *geometry.RectF, edge: app_manifest.ShellEdge, frame: geometry.RectF) void {
+    switch (edge) {
+        .top => {
+            remaining.y += frame.height;
+            remaining.height = @max(remaining.height - frame.height, 0);
+        },
+        .bottom => {
+            remaining.height = @max(remaining.height - frame.height, 0);
+        },
+        .left => {
+            remaining.x += frame.width;
+            remaining.width = @max(remaining.width - frame.width, 0);
+        },
+        .right => {
+            remaining.width = @max(remaining.width - frame.width, 0);
+        },
+    }
+}
+
+fn defaultDockHeight(kind: app_manifest.ViewKind) f32 {
+    return switch (kind) {
+        .toolbar => 48,
+        .titlebar_accessory => 36,
+        .statusbar => 28,
+        else => defaultShellViewHeight(kind, 0),
+    };
+}
+
+fn defaultDockWidth(kind: app_manifest.ViewKind) f32 {
+    return switch (kind) {
+        .sidebar => 240,
+        else => defaultShellViewWidth(kind),
+    };
+}
+
+fn defaultShellViewWidth(kind: app_manifest.ViewKind) f32 {
+    return switch (kind) {
+        .button, .checkbox, .toggle => 96,
+        .label => 160,
+        .spacer => 12,
+        .text_field, .search_field => 220,
+        .sidebar => 240,
+        else => 0,
+    };
+}
+
+fn defaultShellViewHeight(kind: app_manifest.ViewKind, parent_height: f32) f32 {
+    return switch (kind) {
+        .button, .checkbox, .toggle => 32,
+        .label => 24,
+        .spacer => @max(parent_height, 1),
+        .text_field, .search_field => 28,
+        .toolbar => 48,
+        .titlebar_accessory => 36,
+        .statusbar => 28,
+        else => 0,
+    };
+}
+
+fn centeredOffset(parent_height: f32, height: f32) f32 {
+    if (parent_height <= height) return 0;
+    return (parent_height - height) / 2;
+}
+
 const AsyncBridgeResponseSlot = struct {
     in_use: bool = false,
     runtime: ?*Runtime = null,
@@ -1203,6 +2291,12 @@ fn writeWindowJson(window: platform.WindowInfo, output: []u8) ![]const u8 {
     return writer.buffered();
 }
 
+fn writeTrueJson(output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("true");
+    return writer.buffered();
+}
+
 fn writeWebViewOkJson(label: []const u8, window_id: platform.WindowId, output: []u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(output);
     try writer.writeAll("{\"label\":");
@@ -1215,6 +2309,73 @@ fn writeWebViewJson(webview: RuntimeWebView, output: []u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(output);
     try writeWebViewJsonToWriter(webview, &writer);
     return writer.buffered();
+}
+
+fn writeViewJson(view: platform.ViewInfo, output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writeViewJsonToWriter(view, &writer);
+    return writer.buffered();
+}
+
+fn writeCommandEventJson(event_value: CommandEvent, output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"name\":");
+    try json.writeString(&writer, event_value.name);
+    try writer.writeAll(",\"source\":");
+    try json.writeString(&writer, @tagName(event_value.source));
+    try writer.print(",\"windowId\":{d},\"viewLabel\":", .{event_value.window_id});
+    try json.writeString(&writer, event_value.view_label);
+    try writer.writeByte('}');
+    return writer.buffered();
+}
+
+fn writeViewJsonToWriter(view: platform.ViewInfo, writer: anytype) !void {
+    try writer.writeAll("{\"label\":");
+    try json.writeString(writer, view.label);
+    try writer.print(",\"windowId\":{d},\"kind\":", .{view.window_id});
+    try json.writeString(writer, @tagName(view.kind));
+    try writer.writeAll(",\"parent\":");
+    if (view.parent) |parent| {
+        try json.writeString(writer, parent);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"role\":");
+    try json.writeString(writer, view.role);
+    try writer.writeAll(",\"command\":");
+    try json.writeString(writer, view.command);
+    try writer.writeAll(",\"url\":");
+    try json.writeString(writer, view.url);
+    try writer.print(",\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"layer\":{d},\"visible\":{},\"enabled\":{},\"transparent\":{},\"bridge\":{},\"open\":{}}}", .{
+        view.frame.x,
+        view.frame.y,
+        view.frame.width,
+        view.frame.height,
+        view.layer,
+        view.visible,
+        view.enabled,
+        view.transparent,
+        view.bridge_enabled,
+        view.open,
+    });
+}
+
+fn viewInfoFromWebView(webview: RuntimeWebView) platform.ViewInfo {
+    return .{
+        .window_id = webview.window_id,
+        .label = webview.label,
+        .kind = .webview,
+        .parent = null,
+        .frame = webview.frame,
+        .layer = webview.layer,
+        .visible = webview.open,
+        .enabled = true,
+        .role = "webview",
+        .url = webview.url,
+        .transparent = webview.transparent,
+        .bridge_enabled = webview.bridge_enabled,
+        .open = webview.open,
+    };
 }
 
 fn writeWebViewJsonToWriter(webview: RuntimeWebView, writer: anytype) !void {
@@ -1280,9 +2441,31 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
         error.UnsupportedMainWebViewFrame => "This backend does not support resizing the main WebView yet",
         error.UnsupportedMainWebViewZoom => "This backend does not support zooming the main WebView yet",
         error.UnsupportedMainWebViewLayer => "This backend does not support changing the main WebView layer",
-        error.NavigationDenied => "WebView URL is not allowed by navigation policy",
+        error.NavigationDenied => "URL is not allowed by navigation policy",
+        error.InvalidExternalUrl => "External URL is invalid",
+        error.ExternalUrlTooLarge => "External URL is too large",
+        error.InvalidRevealPath => "Reveal path is invalid",
+        error.RevealPathTooLarge => "Reveal path is too large",
+        error.InvalidRecentDocumentPath => "Recent document path is invalid",
+        error.RecentDocumentPathTooLarge => "Recent document path is too large",
+        error.InvalidNotificationOptions => "Notification options are invalid",
+        error.NotificationFieldTooLarge => "Notification field is too large",
+        error.InvalidCredentialOptions => "Credential options are invalid",
+        error.CredentialFieldTooLarge => "Credential field is too large",
+        error.CredentialNotFound => "Credential was not found",
         error.InvalidWindowOptions => "Window options are invalid",
+        error.InvalidCommand => "Command name is invalid",
         error.DuplicateWindowId => "Window id already exists",
+        error.InvalidViewOptions => "View options are invalid",
+        error.InvalidViewWindowId => "view windowId must be a non-negative integer",
+        error.CrossWindowViewDenied => "view windowId must match the calling window",
+        error.ViewNotFound => "View was not found",
+        error.ViewLimitReached => "View limit reached",
+        error.DuplicateViewLabel => "View label already exists",
+        error.ViewLabelTooLarge => "View label is too large",
+        error.ViewRoleTooLarge => "View role is too large",
+        error.UnsupportedViewKind => "This backend does not support this native view kind yet",
+        error.UnsupportedViewFocus => "This backend does not support focusing this native view yet",
         error.NoSpaceLeft => "Native response buffer is too small",
         else => "Native command failed",
     };
@@ -1307,6 +2490,27 @@ fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
         error.UnsupportedMainWebViewFrame,
         error.UnsupportedMainWebViewZoom,
         error.UnsupportedMainWebViewLayer,
+        error.InvalidCommand,
+        error.InvalidViewOptions,
+        error.InvalidViewWindowId,
+        error.CrossWindowViewDenied,
+        error.ViewNotFound,
+        error.ViewLimitReached,
+        error.DuplicateViewLabel,
+        error.ViewLabelTooLarge,
+        error.ViewRoleTooLarge,
+        error.UnsupportedViewKind,
+        error.UnsupportedViewFocus,
+        error.InvalidExternalUrl,
+        error.ExternalUrlTooLarge,
+        error.InvalidRevealPath,
+        error.RevealPathTooLarge,
+        error.InvalidRecentDocumentPath,
+        error.RecentDocumentPathTooLarge,
+        error.InvalidNotificationOptions,
+        error.NotificationFieldTooLarge,
+        error.InvalidCredentialOptions,
+        error.CredentialFieldTooLarge,
         => .invalid_request,
         error.NavigationDenied => .invalid_request,
         else => .internal_error,
@@ -1317,11 +2521,114 @@ fn jsonStringField(payload: []const u8, field: []const u8, storage: *json.String
     return json.stringField(payload, field, storage);
 }
 
+fn validateCommandName(name: []const u8) !void {
+    if (name.len == 0 or name.len > max_command_id_bytes) return error.InvalidCommand;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidCommand;
+    for (name) |ch| {
+        if (ch == 0 or ch == '/' or ch == '\\' or ch == '\n' or ch == '\r' or ch == '\t') return error.InvalidCommand;
+    }
+}
+
+fn validateRevealPath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidRevealPath;
+    if (path.len > platform.max_reveal_path_bytes) return error.RevealPathTooLarge;
+    for (path) |ch| {
+        if (ch == 0) return error.InvalidRevealPath;
+    }
+}
+
+fn validateRecentDocumentPath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidRecentDocumentPath;
+    if (path.len > platform.max_recent_document_path_bytes) return error.RecentDocumentPathTooLarge;
+    for (path) |ch| {
+        if (ch == 0) return error.InvalidRecentDocumentPath;
+    }
+}
+
+fn validateNotificationOptions(options: platform.NotificationOptions) !void {
+    if (options.title.len == 0) return error.InvalidNotificationOptions;
+    try validateNotificationField(options.title, platform.max_notification_title_bytes);
+    try validateNotificationField(options.subtitle, platform.max_notification_subtitle_bytes);
+    try validateNotificationField(options.body, platform.max_notification_body_bytes);
+}
+
+fn validateCredential(credential: platform.Credential) !void {
+    try validateCredentialKey(.{ .service = credential.service, .account = credential.account });
+    try validateCredentialField(credential.secret, platform.max_credential_secret_bytes);
+}
+
+fn validateCredentialKey(key: platform.CredentialKey) !void {
+    try validateCredentialField(key.service, platform.max_credential_service_bytes);
+    try validateCredentialField(key.account, platform.max_credential_account_bytes);
+}
+
+fn validateCredentialField(value: []const u8, max_len: usize) !void {
+    if (value.len == 0) return error.InvalidCredentialOptions;
+    if (value.len > max_len) return error.CredentialFieldTooLarge;
+    for (value) |ch| {
+        if (ch == 0) return error.InvalidCredentialOptions;
+    }
+}
+
+fn validateNotificationField(value: []const u8, max_len: usize) !void {
+    if (value.len > max_len) return error.NotificationFieldTooLarge;
+    for (value) |ch| {
+        if (ch == 0) return error.InvalidNotificationOptions;
+    }
+}
+
 fn webViewWindowIdFromJson(payload: []const u8, default_window_id: platform.WindowId) !platform.WindowId {
     if (json.fieldValue(payload, "windowId") == null) return default_window_id;
     const window_id = jsonIntegerField(payload, "windowId") orelse return error.InvalidWebViewWindowId;
     if (window_id != default_window_id) return error.CrossWindowWebViewDenied;
     return window_id;
+}
+
+fn viewWindowIdFromJson(payload: []const u8, default_window_id: platform.WindowId) !platform.WindowId {
+    if (json.fieldValue(payload, "windowId") == null) return default_window_id;
+    const window_id = jsonIntegerField(payload, "windowId") orelse return error.InvalidViewWindowId;
+    if (window_id != default_window_id) return error.CrossWindowViewDenied;
+    return window_id;
+}
+
+fn viewKindFromString(value: []const u8) ?platform.ViewKind {
+    inline for (@typeInfo(platform.ViewKind).@"enum".fields) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @field(platform.ViewKind, field.name);
+    }
+    if (std.mem.eql(u8, value, "titlebarAccessory")) return .titlebar_accessory;
+    if (std.mem.eql(u8, value, "textField")) return .text_field;
+    if (std.mem.eql(u8, value, "searchField")) return .search_field;
+    if (std.mem.eql(u8, value, "gpuSurface")) return .gpu_surface;
+    return null;
+}
+
+fn viewFrameFromJson(payload: []const u8, required: bool) !?geometry.RectF {
+    const frame_payload = json.fieldValue(payload, "frame") orelse {
+        if (required) return error.InvalidViewOptions;
+        return null;
+    };
+    const width = jsonNumberField(frame_payload, "width") orelse return error.InvalidViewOptions;
+    const height = jsonNumberField(frame_payload, "height") orelse return error.InvalidViewOptions;
+    const frame = geometry.RectF.init(
+        jsonNumberField(frame_payload, "x") orelse 0,
+        jsonNumberField(frame_payload, "y") orelse 0,
+        width,
+        height,
+    );
+    if (frame.x < 0 or frame.y < 0 or frame.width < 0 or frame.height < 0) return error.InvalidViewOptions;
+    return frame;
+}
+
+fn viewLayerFromJson(payload: []const u8) !?i32 {
+    if (json.fieldValue(payload, "layer") == null) return null;
+    const layer_bytes = json.fieldValue(payload, "layer") orelse return error.InvalidViewOptions;
+    const layer_value = std.fmt.parseFloat(f64, layer_bytes) catch return error.InvalidViewOptions;
+    if (!std.math.isFinite(layer_value)) return error.InvalidViewOptions;
+    if (@trunc(layer_value) != layer_value) return error.InvalidViewOptions;
+    const max_layer: f64 = @floatFromInt(std.math.maxInt(i32));
+    const min_layer: f64 = @floatFromInt(std.math.minInt(i32));
+    if (layer_value > max_layer or layer_value < min_layer) return error.InvalidViewOptions;
+    return @as(i32, @intFromFloat(layer_value));
 }
 
 fn webViewFrameFromJson(payload: []const u8) !geometry.RectF {
@@ -1362,6 +2669,30 @@ fn validateWebViewLabel(label: []const u8) !void {
 fn validateChildWebViewLabel(label: []const u8) !void {
     try validateWebViewLabel(label);
     if (isMainWebViewLabel(label)) return error.ReservedWebViewLabel;
+}
+
+fn validateViewOptions(options: platform.ViewOptions) !void {
+    try validateViewLabel(options.label);
+    try validateViewFrame(options.frame);
+    if (options.parent) |parent| {
+        if (parent.len == 0 or parent.len > platform.max_view_label_bytes) return error.InvalidViewOptions;
+    }
+    if (options.role.len > platform.max_view_role_bytes) return error.ViewRoleTooLarge;
+    if (options.command.len > 0) try validateCommandName(options.command);
+    if (options.kind != .webview and options.url.len > 0) return error.InvalidViewOptions;
+}
+
+fn validateViewLabel(label: []const u8) !void {
+    if (label.len == 0) return error.InvalidViewOptions;
+    if (label.len > platform.max_view_label_bytes) return error.ViewLabelTooLarge;
+}
+
+fn validateViewFrame(frame: geometry.RectF) !void {
+    if (frame.x < 0 or frame.y < 0 or frame.width < 0 or frame.height < 0) return error.InvalidViewOptions;
+}
+
+fn isValidWebViewFrame(frame: geometry.RectF) bool {
+    return frame.x >= 0 and frame.y >= 0 and frame.width > 0 and frame.height > 0;
 }
 
 fn webViewUrlOrigin(url: []const u8, buffer: []u8) ![]const u8 {
@@ -1419,6 +2750,13 @@ pub fn TestHarness() type {
     };
 }
 
+fn testViewByLabel(views: []const platform.ViewInfo, label: []const u8) ?platform.ViewInfo {
+    for (views) |view| {
+        if (std.mem.eql(u8, view.label, label)) return view;
+    }
+    return null;
+}
+
 test "runtime loads app source into platform webview" {
     const TestApp = struct {
         fn app(self: *@This()) App {
@@ -1434,6 +2772,341 @@ test "runtime loads app source into platform webview" {
     try std.testing.expectEqual(platform.WebViewSourceKind.html, harness.null_platform.loaded_source.?.kind);
     try std.testing.expectEqualStrings("<h1>Hello</h1>", harness.null_platform.loaded_source.?.bytes);
     try std.testing.expectEqual(@as(u64, 1), harness.runtime.frameDiagnostics().frame_index);
+}
+
+test "runtime lets start hook create views before startup source loads" {
+    const TestApp = struct {
+        created_view: bool = false,
+        source_loaded_after_start: bool = false,
+
+        fn start(context: *anyopaque, runtime: *Runtime) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = try runtime.createView(.{
+                .window_id = 1,
+                .label = "startup-toolbar",
+                .kind = .toolbar,
+                .frame = geometry.RectF.init(0, 0, 640, 44),
+                .role = "toolbar",
+            });
+            self.created_view = true;
+        }
+
+        fn source(context: *anyopaque) anyerror!platform.WebViewSource {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.source_loaded_after_start = self.created_view;
+            return platform.WebViewSource.html("<h1>Native shell</h1>");
+        }
+
+        fn app(self: *@This()) App {
+            return .{
+                .context = self,
+                .name = "startup-native-shell",
+                .source = platform.WebViewSource.html(""),
+                .source_fn = source,
+                .start_fn = start,
+            };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try std.testing.expect(app_state.created_view);
+    try std.testing.expect(app_state.source_loaded_after_start);
+    try std.testing.expectEqualStrings("<h1>Native shell</h1>", harness.null_platform.loaded_source.?.bytes);
+
+    var views_buffer: [4]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    try std.testing.expectEqual(@as(usize, 2), views.len);
+    try std.testing.expectEqualStrings("main", views[0].label);
+    try std.testing.expectEqualStrings("startup-toolbar", views[1].label);
+}
+
+test "runtime exposes startup WebView and native views through generic view API" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "views", .source = platform.WebViewSource.html("<h1>Hello</h1>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    const toolbar = try harness.runtime.createView(.{
+        .window_id = 1,
+        .label = "toolbar",
+        .kind = .toolbar,
+        .frame = geometry.RectF.init(0, 0, 640, 44),
+        .role = "toolbar",
+        .command = "app.toolbar",
+    });
+    try std.testing.expectEqual(platform.ViewKind.toolbar, toolbar.kind);
+    try std.testing.expectEqualStrings("toolbar", toolbar.label);
+    try std.testing.expectEqualStrings("app.toolbar", toolbar.command);
+
+    var views_buffer: [4]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    try std.testing.expectEqual(@as(usize, 2), views.len);
+    try std.testing.expectEqual(platform.ViewKind.webview, views[0].kind);
+    try std.testing.expectEqualStrings("main", views[0].label);
+    try std.testing.expectEqual(platform.ViewKind.toolbar, views[1].kind);
+    try std.testing.expectEqualStrings("toolbar", views[1].label);
+
+    try harness.runtime.focusView(1, "toolbar");
+
+    const updated = try harness.runtime.updateView(1, "toolbar", .{
+        .frame = geometry.RectF.init(0, 0, 640, 52),
+        .visible = false,
+        .command = "app.toolbar.updated",
+    });
+    try std.testing.expectEqual(@as(f32, 52), updated.frame.height);
+    try std.testing.expect(!updated.visible);
+    try std.testing.expectEqualStrings("app.toolbar.updated", updated.command);
+
+    try harness.runtime.closeView(1, "toolbar");
+    const remaining = harness.runtime.listViews(1, &views_buffer);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("main", remaining[0].label);
+}
+
+test "runtime createView routes webview kind through WebView backend" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-view", .source = platform.WebViewSource.html("<h1>Hello</h1>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    const preview = try harness.runtime.createView(.{
+        .window_id = 1,
+        .label = "preview",
+        .kind = .webview,
+        .url = "zero://app/preview.html",
+        .frame = geometry.RectF.init(10, 10, 320, 240),
+        .layer = 5,
+        .bridge_enabled = true,
+    });
+    try std.testing.expectEqual(platform.ViewKind.webview, preview.kind);
+    try std.testing.expectEqualStrings("zero://app/preview.html", preview.url);
+    try std.testing.expect(preview.bridge_enabled);
+    try std.testing.expectEqual(@as(usize, 1), harness.runtime.webview_count);
+
+    const updated = try harness.runtime.updateView(1, "preview", .{
+        .url = "zero://app/updated.html",
+        .layer = 8,
+    });
+    try std.testing.expectEqualStrings("zero://app/updated.html", updated.url);
+    try std.testing.expectEqual(@as(i32, 8), updated.layer);
+
+    var views_buffer: [4]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    try std.testing.expectEqual(@as(usize, 2), views.len);
+    try std.testing.expectEqualStrings("main", views[0].label);
+    try std.testing.expectEqualStrings("preview", views[1].label);
+
+    try harness.runtime.closeView(1, "preview");
+    try std.testing.expectEqual(@as(usize, 0), harness.runtime.webview_count);
+}
+
+test "runtime materializes manifest shell windows into laid out views" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "shell-materialize", .source = platform.WebViewSource.html("<h1>Host</h1>") };
+        }
+    };
+
+    const shell_views = [_]app_manifest.ShellView{
+        .{ .label = "refresh-button", .kind = .button, .parent = "toolbar", .text = "Refresh", .command = "app.refresh" },
+        .{ .label = "toolbar-search", .kind = .search_field, .parent = "toolbar", .text = "Search" },
+        .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 52, .role = "Toolbar" },
+        .{ .label = "sidebar-live", .kind = .checkbox, .parent = "sidebar", .x = 18, .y = 92, .text = "Live" },
+        .{ .label = "sidebar-mode", .kind = .toggle, .parent = "sidebar", .x = 18, .y = 128, .text = "Mode" },
+        .{ .label = "sidebar", .kind = .sidebar, .edge = .left, .width = 240, .role = "Sidebar" },
+        .{ .label = "content", .kind = .webview, .url = "zero://app/content.html", .fill = true },
+        .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = 28, .text = "Ready" },
+    };
+    const shell_window: app_manifest.ShellWindow = .{
+        .label = "shell",
+        .title = "Shell",
+        .width = 1000,
+        .height = 700,
+        .restore_policy = .center_on_primary,
+        .views = &shell_views,
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    const window = try harness.runtime.createShellWindow(shell_window, platform.WebViewSource.html("<h1>Shell</h1>"));
+    try std.testing.expectEqual(@as(platform.WindowId, 2), window.id);
+    try std.testing.expectEqualStrings("shell", window.label);
+
+    var views_buffer: [12]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(window.id, &views_buffer);
+    const toolbar = testViewByLabel(views, "toolbar").?;
+    const refresh = testViewByLabel(views, "refresh-button").?;
+    const search = testViewByLabel(views, "toolbar-search").?;
+    const sidebar = testViewByLabel(views, "sidebar").?;
+    const checkbox = testViewByLabel(views, "sidebar-live").?;
+    const toggle = testViewByLabel(views, "sidebar-mode").?;
+    const content = testViewByLabel(views, "content").?;
+    const statusbar = testViewByLabel(views, "statusbar").?;
+
+    try std.testing.expectEqual(platform.ViewKind.toolbar, toolbar.kind);
+    try std.testing.expectEqual(@as(f32, 0), toolbar.frame.x);
+    try std.testing.expectEqual(@as(f32, 0), toolbar.frame.y);
+    try std.testing.expectEqual(@as(f32, 1000), toolbar.frame.width);
+    try std.testing.expectEqual(@as(f32, 52), toolbar.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.button, refresh.kind);
+    try std.testing.expectEqualStrings("toolbar", refresh.parent.?);
+    try std.testing.expectEqualStrings("Refresh", refresh.role);
+    try std.testing.expectEqualStrings("app.refresh", refresh.command);
+    try std.testing.expectEqual(@as(f32, 8), refresh.frame.x);
+    try std.testing.expectEqual(@as(f32, 10), refresh.frame.y);
+    try std.testing.expectEqual(@as(f32, 96), refresh.frame.width);
+    try std.testing.expectEqual(@as(f32, 32), refresh.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.search_field, search.kind);
+    try std.testing.expectEqualStrings("toolbar", search.parent.?);
+    try std.testing.expectEqualStrings("Search", search.role);
+    try std.testing.expectEqual(@as(f32, 112), search.frame.x);
+    try std.testing.expectEqual(@as(f32, 12), search.frame.y);
+    try std.testing.expectEqual(@as(f32, 220), search.frame.width);
+    try std.testing.expectEqual(@as(f32, 28), search.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.sidebar, sidebar.kind);
+    try std.testing.expectEqual(@as(f32, 0), sidebar.frame.x);
+    try std.testing.expectEqual(@as(f32, 52), sidebar.frame.y);
+    try std.testing.expectEqual(@as(f32, 240), sidebar.frame.width);
+    try std.testing.expectEqual(@as(f32, 648), sidebar.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.checkbox, checkbox.kind);
+    try std.testing.expectEqualStrings("Live", checkbox.role);
+    try std.testing.expectEqual(@as(f32, 18), checkbox.frame.x);
+    try std.testing.expectEqual(@as(f32, 92), checkbox.frame.y);
+    try std.testing.expectEqual(@as(f32, 96), checkbox.frame.width);
+    try std.testing.expectEqual(@as(f32, 32), checkbox.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.toggle, toggle.kind);
+    try std.testing.expectEqualStrings("Mode", toggle.role);
+    try std.testing.expectEqual(@as(f32, 18), toggle.frame.x);
+    try std.testing.expectEqual(@as(f32, 128), toggle.frame.y);
+    try std.testing.expectEqual(@as(f32, 96), toggle.frame.width);
+    try std.testing.expectEqual(@as(f32, 32), toggle.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.statusbar, statusbar.kind);
+    try std.testing.expectEqualStrings("Ready", statusbar.role);
+    try std.testing.expectEqual(@as(f32, 240), statusbar.frame.x);
+    try std.testing.expectEqual(@as(f32, 672), statusbar.frame.y);
+    try std.testing.expectEqual(@as(f32, 760), statusbar.frame.width);
+    try std.testing.expectEqual(@as(f32, 28), statusbar.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.webview, content.kind);
+    try std.testing.expect(content.bridge_enabled);
+    try std.testing.expectEqualStrings("zero://app/content.html", content.url);
+    try std.testing.expectEqual(@as(f32, 240), content.frame.x);
+    try std.testing.expectEqual(@as(f32, 52), content.frame.y);
+    try std.testing.expectEqual(@as(f32, 760), content.frame.width);
+    try std.testing.expectEqual(@as(f32, 620), content.frame.height);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .surface_resized = .{
+        .id = window.id,
+        .size = geometry.SizeF.init(1200, 800),
+        .scale_factor = 1,
+    } });
+
+    const resized_views = harness.runtime.listViews(window.id, &views_buffer);
+    const resized_toolbar = testViewByLabel(resized_views, "toolbar").?;
+    const resized_sidebar = testViewByLabel(resized_views, "sidebar").?;
+    const resized_content = testViewByLabel(resized_views, "content").?;
+    const resized_statusbar = testViewByLabel(resized_views, "statusbar").?;
+
+    try std.testing.expectEqual(@as(f32, 1200), resized_toolbar.frame.width);
+    try std.testing.expectEqual(@as(f32, 748), resized_sidebar.frame.height);
+    try std.testing.expectEqual(@as(f32, 960), resized_content.frame.width);
+    try std.testing.expectEqual(@as(f32, 720), resized_content.frame.height);
+    try std.testing.expectEqual(@as(f32, 772), resized_statusbar.frame.y);
+}
+
+test "runtime relayouts shell views attached to startup window" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "startup-shell-layout", .source = platform.WebViewSource.html("<h1>Startup</h1>") };
+        }
+    };
+
+    const shell_views = [_]app_manifest.ShellView{
+        .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 50 },
+        .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
+        .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = 30 },
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{ .id = 1, .size = geometry.SizeF.init(800, 600) });
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+    try harness.runtime.createShellViews(1, &shell_views, geometry.RectF.init(0, 0, 800, 600));
+
+    var views_buffer: [4]platform.ViewInfo = undefined;
+    var views = harness.runtime.listViews(1, &views_buffer);
+    var main = testViewByLabel(views, "main").?;
+    try std.testing.expectEqual(@as(f32, 0), main.frame.x);
+    try std.testing.expectEqual(@as(f32, 50), main.frame.y);
+    try std.testing.expectEqual(@as(f32, 800), main.frame.width);
+    try std.testing.expectEqual(@as(f32, 520), main.frame.height);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .surface_resized = .{
+        .id = 1,
+        .size = geometry.SizeF.init(900, 500),
+        .scale_factor = 1,
+    } });
+
+    views = harness.runtime.listViews(1, &views_buffer);
+    main = testViewByLabel(views, "main").?;
+    const toolbar = testViewByLabel(views, "toolbar").?;
+    const statusbar = testViewByLabel(views, "statusbar").?;
+    try std.testing.expectEqual(@as(f32, 900), toolbar.frame.width);
+    try std.testing.expectEqual(@as(f32, 470), statusbar.frame.y);
+    try std.testing.expectEqual(@as(f32, 900), main.frame.width);
+    try std.testing.expectEqual(@as(f32, 420), main.frame.height);
+}
+
+test "runtime automation snapshot includes generic views" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "snapshot-views", .source = platform.WebViewSource.html("<h1>Hello</h1>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+    _ = try harness.runtime.createView(.{
+        .window_id = 1,
+        .label = "status",
+        .kind = .statusbar,
+        .frame = geometry.RectF.init(0, 440, 640, 40),
+        .role = "status",
+    });
+
+    const snapshot = harness.runtime.automationSnapshot("Snapshot");
+    try std.testing.expect(snapshot.views.len >= 2);
+    try std.testing.expectEqualStrings("main", snapshot.views[0].label);
+    try std.testing.expectEqual(platform.ViewKind.webview, snapshot.views[0].kind);
+    try std.testing.expectEqualStrings("status", snapshot.views[1].label);
+    try std.testing.expectEqual(platform.ViewKind.statusbar, snapshot.views[1].kind);
 }
 
 test "runtime configures platform keyboard shortcuts" {
@@ -1454,6 +3127,121 @@ test "runtime configures platform keyboard shortcuts" {
 
     try std.testing.expectEqual(@as(usize, 1), harness.null_platform.configuredShortcuts().len);
     try std.testing.expectEqualStrings("command.palette", harness.null_platform.configuredShortcuts()[0].id);
+}
+
+test "runtime dispatches app activation lifecycle events" {
+    const TestApp = struct {
+        events: [4]LifecycleEvent = undefined,
+        len: usize = 0,
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "activation", .source = platform.WebViewSource.html("<h1>Activation</h1>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .lifecycle => |lifecycle| {
+                    self.events[self.len] = lifecycle;
+                    self.len += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    const app = app_state.app();
+    try harness.start(app);
+    const event_count_before = harness.null_platform.windowEventCount();
+    try harness.runtime.dispatchPlatformEvent(app, .app_activated);
+    try std.testing.expectEqual(event_count_before + 1, harness.null_platform.windowEventCount());
+    try std.testing.expectEqual(@as(platform.WindowId, 1), harness.null_platform.lastWindowEventWindowId());
+    try std.testing.expectEqualStrings("app:activate", harness.null_platform.lastWindowEventName());
+    try std.testing.expectEqualStrings("{}", harness.null_platform.lastWindowEventDetail());
+    try harness.runtime.dispatchPlatformEvent(app, .app_deactivated);
+    try std.testing.expectEqual(event_count_before + 2, harness.null_platform.windowEventCount());
+    try std.testing.expectEqualStrings("app:deactivate", harness.null_platform.lastWindowEventName());
+
+    try std.testing.expectEqual(@as(usize, 4), app_state.len);
+    try std.testing.expectEqual(LifecycleEvent.start, app_state.events[0]);
+    try std.testing.expectEqual(LifecycleEvent.frame, app_state.events[1]);
+    try std.testing.expectEqual(LifecycleEvent.activate, app_state.events[2]);
+    try std.testing.expectEqual(LifecycleEvent.deactivate, app_state.events[3]);
+}
+
+test "runtime dispatches shortcut command events" {
+    const TestApp = struct {
+        command_count: u32 = 0,
+        shortcut_count: u32 = 0,
+        last_name: []const u8 = "",
+        last_source: CommandSource = .runtime,
+        last_window_id: platform.WindowId = 0,
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "shortcut-command", .source = platform.WebViewSource.html("<h1>Shortcuts</h1>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .command => |command| {
+                    self.command_count += 1;
+                    self.last_name = command.name;
+                    self.last_source = command.source;
+                    self.last_window_id = command.window_id;
+                },
+                .shortcut => {
+                    self.shortcut_count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .shortcut = .{
+        .id = "app.refresh",
+        .key = "r",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+
+    try std.testing.expectEqual(@as(u32, 1), app_state.command_count);
+    try std.testing.expectEqual(@as(u32, 1), app_state.shortcut_count);
+    try std.testing.expectEqualStrings("app.refresh", app_state.last_name);
+    try std.testing.expectEqual(CommandSource.shortcut, app_state.last_source);
+    try std.testing.expectEqual(@as(platform.WindowId, 1), app_state.last_window_id);
+}
+
+test "runtime configures platform menus" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "menus", .source = platform.WebViewSource.html("<h1>Menus</h1>") };
+        }
+    };
+
+    const items = [_]platform.MenuItem{
+        .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
+    };
+    const menus = [_]platform.Menu{.{ .title = "View", .items = &items }};
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.menus = &menus;
+    var app_state: TestApp = .{};
+    try harness.runtime.run(app_state.app());
+
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.configuredMenus().len);
+    try std.testing.expectEqualStrings("View", harness.null_platform.configuredMenus()[0].title);
+    try std.testing.expectEqualStrings("app.refresh", harness.null_platform.configuredMenus()[0].items[0].command);
 }
 
 test "runtime rejects invalid keyboard shortcuts" {
@@ -1741,6 +3529,179 @@ test "runtime handles built-in JavaScript window bridge commands" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"open\":false") != null);
 }
 
+test "runtime handles built-in JavaScript command bridge commands" {
+    const TestApp = struct {
+        command_count: u32 = 0,
+        last_name: []const u8 = "",
+        last_source: CommandSource = .runtime,
+        last_window_id: platform.WindowId = 0,
+        last_view_label: []const u8 = "",
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "command-bridge", .source = platform.WebViewSource.html("<p>Commands</p>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .command => |command| {
+                    self.command_count += 1;
+                    self.last_name = command.name;
+                    self.last_source = command.source;
+                    self.last_window_id = command.window_id;
+                    self.last_view_label = command.view_label;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const command_origins = [_][]const u8{"zero://inline"};
+    harness.runtime.options.security.navigation.allowed_origins = &command_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.command.invoke\",\"payload\":{\"name\":\"app.save\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+        .webview_label = "main",
+    } });
+    try std.testing.expectEqual(@as(u32, 1), app_state.command_count);
+    try std.testing.expectEqualStrings("app.save", app_state.last_name);
+    try std.testing.expectEqual(CommandSource.bridge, app_state.last_source);
+    try std.testing.expectEqual(@as(platform.WindowId, 1), app_state.last_window_id);
+    try std.testing.expectEqualStrings("", app_state.last_view_label);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"name\":\"app.save\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"source\":\"bridge\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"2\",\"command\":\"zero-native.command.invoke\",\"payload\":{\"id\":\"app.open\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+        .webview_label = "toolbar",
+    } });
+    try std.testing.expectEqual(@as(u32, 2), app_state.command_count);
+    try std.testing.expectEqualStrings("app.open", app_state.last_name);
+    try std.testing.expectEqualStrings("toolbar", app_state.last_view_label);
+}
+
+test "runtime dispatches native view command events" {
+    const TestApp = struct {
+        command_count: u32 = 0,
+        last_name: []const u8 = "",
+        last_source: CommandSource = .runtime,
+        last_window_id: platform.WindowId = 0,
+        last_view_label: []const u8 = "",
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "native-command", .source = platform.WebViewSource.html("<p>Native</p>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .command => |command| {
+                    self.command_count += 1;
+                    self.last_name = command.name;
+                    self.last_source = command.source;
+                    self.last_window_id = command.window_id;
+                    self.last_view_label = command.view_label;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .native_command = .{
+        .name = "app.refresh",
+        .window_id = 1,
+        .view_label = "refresh-button",
+    } });
+
+    try std.testing.expectEqual(@as(u32, 1), app_state.command_count);
+    try std.testing.expectEqualStrings("app.refresh", app_state.last_name);
+    try std.testing.expectEqual(CommandSource.native_view, app_state.last_source);
+    try std.testing.expectEqual(@as(platform.WindowId, 1), app_state.last_window_id);
+    try std.testing.expectEqualStrings("refresh-button", app_state.last_view_label);
+
+    _ = try harness.runtime.createView(.{
+        .label = "toolbar",
+        .kind = .toolbar,
+        .frame = geometry.RectF.init(0, 0, 640, 48),
+    });
+    _ = try harness.runtime.createView(.{
+        .label = "toolbar-refresh",
+        .kind = .button,
+        .parent = "toolbar",
+        .frame = geometry.RectF.init(8, 8, 96, 32),
+        .command = "app.refresh",
+    });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .native_command = .{
+        .name = "app.refresh",
+        .window_id = 1,
+        .view_label = "toolbar-refresh",
+    } });
+
+    try std.testing.expectEqual(@as(u32, 2), app_state.command_count);
+    try std.testing.expectEqual(CommandSource.toolbar, app_state.last_source);
+    try std.testing.expectEqualStrings("toolbar-refresh", app_state.last_view_label);
+}
+
+test "runtime dispatches menu command events" {
+    const TestApp = struct {
+        command_count: u32 = 0,
+        last_name: []const u8 = "",
+        last_source: CommandSource = .runtime,
+        last_window_id: platform.WindowId = 0,
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "menu-command", .source = platform.WebViewSource.html("<p>Menu</p>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .command => |command| {
+                    self.command_count += 1;
+                    self.last_name = command.name;
+                    self.last_source = command.source;
+                    self.last_window_id = command.window_id;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .menu_command = .{
+        .name = "app.refresh",
+        .window_id = 1,
+    } });
+
+    try std.testing.expectEqual(@as(u32, 1), app_state.command_count);
+    try std.testing.expectEqualStrings("app.refresh", app_state.last_name);
+    try std.testing.expectEqual(CommandSource.menu, app_state.last_source);
+    try std.testing.expectEqual(@as(platform.WindowId, 1), app_state.last_window_id);
+}
+
 test "runtime handles built-in JavaScript webview bridge commands" {
     const TestApp = struct {
         fn app(self: *@This()) App {
@@ -1847,6 +3808,76 @@ test "runtime handles built-in JavaScript webview bridge commands" {
         .window_id = 1,
     } });
     try std.testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
+}
+
+test "runtime handles built-in JavaScript view bridge commands" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "view-bridge", .source = platform.WebViewSource.html("<p>Views</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const view_origins = [_][]const u8{ "zero://inline", "zero://app" };
+    harness.runtime.options.security.navigation.allowed_origins = &view_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.view.create\",\"payload\":{\"label\":\"toolbar\",\"kind\":\"toolbar\",\"frame\":{\"x\":0,\"y\":0,\"width\":640,\"height\":44},\"role\":\"toolbar\",\"layer\":3}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"kind\":\"toolbar\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), harness.runtime.view_count);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"2\",\"command\":\"zero-native.view.list\",\"payload\":{}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"toolbar\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"3\",\"command\":\"zero-native.view.focus\",\"payload\":{\"label\":\"toolbar\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"toolbar\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"4\",\"command\":\"zero-native.view.setFrame\",\"payload\":{\"label\":\"toolbar\",\"frame\":{\"x\":0,\"y\":0,\"width\":640,\"height\":52}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"height\":52") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"5\",\"command\":\"zero-native.view.setVisible\",\"payload\":{\"label\":\"toolbar\",\"visible\":false}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"visible\":false") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"6\",\"command\":\"zero-native.view.update\",\"payload\":{\"label\":\"toolbar\",\"visible\":true,\"enabled\":false,\"role\":\"banner\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"role\":\"banner\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"7\",\"command\":\"zero-native.view.close\",\"payload\":{\"label\":\"toolbar\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"open\":false") != null);
+    try std.testing.expectEqual(@as(usize, 0), harness.runtime.view_count);
 }
 
 test "runtime returns closed webview info before compacting storage" {
@@ -2253,6 +4284,185 @@ test "runtime denies built-in dialog bridge commands by default" {
     } });
 
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"permission_denied\"") != null);
+}
+
+test "runtime validates native OS actions before platform dispatch" {
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+
+    try std.testing.expectError(error.InvalidNotificationOptions, harness.runtime.showNotification(.{ .title = "" }));
+    try harness.runtime.showNotification(.{
+        .title = "Build finished",
+        .subtitle = "zero-native",
+        .body = "All checks passed.",
+    });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.notificationCount());
+    try std.testing.expectEqualStrings("Build finished", harness.null_platform.lastNotificationTitle());
+    try std.testing.expectEqualStrings("zero-native", harness.null_platform.lastNotificationSubtitle());
+    try std.testing.expectEqualStrings("All checks passed.", harness.null_platform.lastNotificationBody());
+
+    try std.testing.expectError(error.NavigationDenied, harness.runtime.openExternalUrl("https://example.com/docs"));
+    try std.testing.expectError(error.InvalidExternalUrl, harness.runtime.openExternalUrl("mailto:hello@example.com"));
+
+    const allowed_urls = [_][]const u8{"https://example.com/*"};
+    harness.runtime.options.security.navigation.external_links = .{
+        .action = .open_system_browser,
+        .allowed_urls = &allowed_urls,
+    };
+    try harness.runtime.openExternalUrl("https://example.com/docs");
+    try std.testing.expectEqualStrings("https://example.com/docs", harness.null_platform.lastExternalUrl());
+
+    try std.testing.expectError(error.InvalidRevealPath, harness.runtime.revealPath(""));
+    try harness.runtime.revealPath("/tmp/zero-native-example.txt");
+    try std.testing.expectEqualStrings("/tmp/zero-native-example.txt", harness.null_platform.lastRevealedPath());
+
+    try std.testing.expectError(error.InvalidRecentDocumentPath, harness.runtime.addRecentDocument(""));
+    try harness.runtime.addRecentDocument("/tmp/recent-zero-native-example.txt");
+    try std.testing.expectEqualStrings("/tmp/recent-zero-native-example.txt", harness.null_platform.lastRecentDocumentPath());
+    try harness.runtime.clearRecentDocuments();
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.recentDocumentsClearedCount());
+
+    try std.testing.expectError(error.InvalidCredentialOptions, harness.runtime.setCredential(.{ .service = "", .account = "alice", .secret = "secret-token" }));
+    try std.testing.expectError(error.InvalidCredentialOptions, harness.runtime.setCredential(.{ .service = "dev.zero-native.test", .account = "alice", .secret = "" }));
+    try harness.runtime.setCredential(.{ .service = "dev.zero-native.test", .account = "alice", .secret = "secret-token" });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.credentialSetCount());
+    try std.testing.expectEqualStrings("dev.zero-native.test", harness.null_platform.lastCredentialService());
+    try std.testing.expectEqualStrings("alice", harness.null_platform.lastCredentialAccount());
+    try std.testing.expectEqualStrings("secret-token", harness.null_platform.lastCredentialSecret());
+
+    var credential_buffer: [64]u8 = undefined;
+    const secret = (try harness.runtime.getCredential(.{ .service = "dev.zero-native.test", .account = "alice" }, &credential_buffer)).?;
+    try std.testing.expectEqualStrings("secret-token", secret);
+    try std.testing.expectEqual(@as(?[]const u8, null), try harness.runtime.getCredential(.{ .service = "dev.zero-native.test", .account = "bob" }, &credential_buffer));
+    try std.testing.expect(try harness.runtime.deleteCredential(.{ .service = "dev.zero-native.test", .account = "alice" }));
+    try std.testing.expect(!try harness.runtime.deleteCredential(.{ .service = "dev.zero-native.test", .account = "alice" }));
+}
+
+test "runtime gates built-in OS bridge commands through explicit policy" {
+    var app_state: u8 = 0;
+    const app = App{ .context = &app_state, .name = "os-bridge", .source = platform.WebViewSource.html("<p>OS</p>") };
+
+    var denied: TestHarness() = undefined;
+    denied.init(.{});
+    try denied.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"open\",\"command\":\"zero-native.os.openUrl\",\"payload\":{\"url\":\"https://example.com/docs\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, denied.null_platform.lastBridgeResponse(), "OS API is not permitted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.null_platform.lastBridgeResponse(), "\"permission_denied\"") != null);
+
+    const grants = [_][]const u8{ security.permission_network, security.permission_filesystem, security.permission_notifications };
+    const network_permission = [_][]const u8{security.permission_network};
+    const filesystem_permission = [_][]const u8{security.permission_filesystem};
+    const notifications_permission = [_][]const u8{security.permission_notifications};
+    const origins = [_][]const u8{"zero://inline"};
+    const policies = [_]bridge.CommandPolicy{
+        .{ .name = "zero-native.os.openUrl", .permissions = &network_permission, .origins = &origins },
+        .{ .name = "zero-native.os.showNotification", .permissions = &notifications_permission, .origins = &origins },
+        .{ .name = "zero-native.os.revealPath", .permissions = &filesystem_permission, .origins = &origins },
+        .{ .name = "zero-native.os.addRecentDocument", .permissions = &filesystem_permission, .origins = &origins },
+        .{ .name = "zero-native.os.clearRecentDocuments", .permissions = &filesystem_permission, .origins = &origins },
+    };
+    const allowed_urls = [_][]const u8{"https://example.com/*"};
+
+    var allowed: TestHarness() = undefined;
+    allowed.init(.{});
+    allowed.runtime.options.security.permissions = &grants;
+    allowed.runtime.options.security.navigation.external_links = .{
+        .action = .open_system_browser,
+        .allowed_urls = &allowed_urls,
+    };
+    allowed.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &policies };
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"notify\",\"command\":\"zero-native.os.showNotification\",\"payload\":{\"title\":\"Build finished\",\"subtitle\":\"zero-native\",\"body\":\"All checks passed.\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), allowed.null_platform.notificationCount());
+    try std.testing.expectEqualStrings("Build finished", allowed.null_platform.lastNotificationTitle());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"open\",\"command\":\"zero-native.os.openUrl\",\"payload\":{\"url\":\"https://example.com/docs\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqualStrings("https://example.com/docs", allowed.null_platform.lastExternalUrl());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"reveal\",\"command\":\"zero-native.os.revealPath\",\"payload\":{\"path\":\"/tmp/zero-native-example.txt\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqualStrings("/tmp/zero-native-example.txt", allowed.null_platform.lastRevealedPath());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"recent\",\"command\":\"zero-native.os.addRecentDocument\",\"payload\":{\"path\":\"/tmp/recent-zero-native-example.txt\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqualStrings("/tmp/recent-zero-native-example.txt", allowed.null_platform.lastRecentDocumentPath());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"clear-recent\",\"command\":\"zero-native.os.clearRecentDocuments\",\"payload\":{}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), allowed.null_platform.recentDocumentsClearedCount());
+}
+
+test "runtime gates built-in credential bridge commands through explicit policy" {
+    var app_state: u8 = 0;
+    const app = App{ .context = &app_state, .name = "credential-bridge", .source = platform.WebViewSource.html("<p>Credentials</p>") };
+
+    var denied: TestHarness() = undefined;
+    denied.init(.{});
+    try denied.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"set\",\"command\":\"zero-native.credentials.set\",\"payload\":{\"service\":\"dev.zero-native.test\",\"account\":\"alice\",\"secret\":\"secret-token\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, denied.null_platform.lastBridgeResponse(), "Credentials API is not permitted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.null_platform.lastBridgeResponse(), "\"permission_denied\"") != null);
+
+    const grants = [_][]const u8{security.permission_credentials};
+    const credential_permission = [_][]const u8{security.permission_credentials};
+    const origins = [_][]const u8{"zero://inline"};
+    const policies = [_]bridge.CommandPolicy{
+        .{ .name = "zero-native.credentials.set", .permissions = &credential_permission, .origins = &origins },
+        .{ .name = "zero-native.credentials.get", .permissions = &credential_permission, .origins = &origins },
+        .{ .name = "zero-native.credentials.delete", .permissions = &credential_permission, .origins = &origins },
+    };
+
+    var allowed: TestHarness() = undefined;
+    allowed.init(.{});
+    allowed.runtime.options.security.permissions = &grants;
+    allowed.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &policies };
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"set\",\"command\":\"zero-native.credentials.set\",\"payload\":{\"service\":\"dev.zero-native.test\",\"account\":\"alice\",\"secret\":\"secret-token\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), allowed.null_platform.credentialSetCount());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"get\",\"command\":\"zero-native.credentials.get\",\"payload\":{\"service\":\"dev.zero-native.test\",\"account\":\"alice\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"result\":\"secret-token\"") != null);
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"delete\",\"command\":\"zero-native.credentials.delete\",\"payload\":{\"service\":\"dev.zero-native.test\",\"account\":\"alice\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"result\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), allowed.null_platform.credentialDeleteCount());
+
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"get-missing\",\"command\":\"zero-native.credentials.get\",\"payload\":{\"service\":\"dev.zero-native.test\",\"account\":\"alice\"}}",
+        .origin = "zero://inline",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"result\":null") != null);
 }
 
 test "runtime builtin JSON field reader only reads top-level fields" {

@@ -130,6 +130,123 @@ export interface ZeroNativeWebViewHandle extends ZeroNativeWebViewInfo {
   close(): Promise<ZeroNativeWebViewInfo>;
 }
 
+export type ZeroNativeViewKind =
+  | "webview"
+  | "toolbar"
+  | "titlebar_accessory"
+  | "titlebarAccessory"
+  | "sidebar"
+  | "statusbar"
+  | "split"
+  | "stack"
+  | "button"
+  | "checkbox"
+  | "toggle"
+  | "text_field"
+  | "textField"
+  | "search_field"
+  | "searchField"
+  | "label"
+  | "spacer"
+  | "gpu_surface"
+  | "gpuSurface";
+
+export interface ZeroNativeViewInfo {
+  label: string;
+  windowId: number;
+  kind: ZeroNativeViewKind;
+  parent: string | null;
+  role: string;
+  url: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  layer: number;
+  visible: boolean;
+  enabled: boolean;
+  transparent: boolean;
+  bridge: boolean;
+  command: string;
+  open: boolean;
+}
+
+export interface ZeroNativeCreateViewOptions {
+  label: string;
+  kind: ZeroNativeViewKind;
+  windowId?: number;
+  parent?: string;
+  frame?: ZeroNativeRect;
+  layer?: number;
+  visible?: boolean;
+  enabled?: boolean;
+  role?: string;
+  command?: string;
+  /** Required when kind is "webview". Ignored for native view kinds. */
+  url?: string;
+  transparent?: boolean;
+  bridge?: boolean;
+}
+
+export interface ZeroNativeUpdateViewOptions {
+  label: string;
+  windowId?: number;
+  frame?: ZeroNativeRect;
+  layer?: number;
+  visible?: boolean;
+  enabled?: boolean;
+  role?: string;
+  command?: string;
+  /** Only valid for WebView-backed views. */
+  url?: string;
+}
+
+export interface ZeroNativeSetViewFrameOptions {
+  label: string;
+  windowId?: number;
+  frame: ZeroNativeRect;
+}
+
+export interface ZeroNativeSetViewVisibleOptions {
+  label: string;
+  windowId?: number;
+  visible: boolean;
+}
+
+export interface ZeroNativeViewSelector {
+  label: string;
+  windowId?: number;
+}
+
+export interface ZeroNativeViewHandle extends ZeroNativeViewInfo {
+  update(patch: Omit<ZeroNativeUpdateViewOptions, "label" | "windowId">): Promise<ZeroNativeViewHandle>;
+  setFrame(frame: ZeroNativeRect): Promise<ZeroNativeViewHandle>;
+  setVisible(visible: boolean): Promise<ZeroNativeViewHandle>;
+  focus(): Promise<ZeroNativeViewHandle>;
+  close(): Promise<ZeroNativeViewInfo>;
+}
+
+export type ZeroNativeCommandSource =
+  | "runtime"
+  | "menu"
+  | "shortcut"
+  | "toolbar"
+  | "tray"
+  | "native_view"
+  | "bridge";
+
+export interface ZeroNativeCommandEvent {
+  name: string;
+  source: ZeroNativeCommandSource;
+  windowId: number;
+  viewLabel: string;
+}
+
+export interface ZeroNativeCommandSelector {
+  name?: string;
+  id?: string;
+}
+
 export interface ZeroNativeShortcutModifiers {
   primary: boolean;
   command: boolean;
@@ -146,6 +263,8 @@ export interface ZeroNativeShortcutDetail {
   windowId: number;
   modifiers: ZeroNativeShortcutModifiers;
 }
+
+export type ZeroNativeAppLifecycleDetail = Record<string, never>;
 
 export interface ZeroNativeOpenFileOptions {
   title?: string;
@@ -170,12 +289,45 @@ export interface ZeroNativeMessageDialogOptions {
   tertiaryButton?: string;
 }
 
+export interface ZeroNativeOpenUrlOptions {
+  url: string;
+}
+
+export interface ZeroNativeRevealPathOptions {
+  path: string;
+}
+
+export interface ZeroNativeRecentDocumentOptions {
+  path: string;
+}
+
+export interface ZeroNativeNotificationOptions {
+  title: string;
+  subtitle?: string;
+  body?: string;
+}
+
+export interface ZeroNativeCredentialKey {
+  service: string;
+  account: string;
+}
+
+export interface ZeroNativeSetCredentialOptions extends ZeroNativeCredentialKey {
+  secret: string;
+}
+
 export interface ZeroNativeApi {
   invoke<T = ZeroNativeJson>(command: string, payload?: ZeroNativeJson): Promise<T>;
   on(name: "shortcut", callback: (detail: ZeroNativeShortcutDetail) => void): () => void;
+  on(name: "app:activate" | "app:deactivate", callback: (detail: ZeroNativeAppLifecycleDetail) => void): () => void;
   on<T = ZeroNativeJson>(name: string, callback: (detail: T) => void): () => void;
   off(name: "shortcut", callback: (detail: ZeroNativeShortcutDetail) => void): void;
+  off(name: "app:activate" | "app:deactivate", callback: (detail: ZeroNativeAppLifecycleDetail) => void): void;
   off<T = ZeroNativeJson>(name: string, callback: (detail: T) => void): void;
+  /** Dispatch an app command through the runtime command path. */
+  commands: {
+    invoke(command: string | ZeroNativeCommandSelector): Promise<ZeroNativeCommandEvent>;
+  };
   windows: {
     create(options?: ZeroNativeCreateWindowOptions): Promise<ZeroNativeWindowInfo>;
     list(): Promise<ZeroNativeWindowInfo[]>;
@@ -192,10 +344,32 @@ export interface ZeroNativeApi {
     setLayer(options: ZeroNativeSetWebViewLayerOptions): Promise<ZeroNativeWebViewInfo>;
     close(options?: ZeroNativeCloseWebViewOptions): Promise<ZeroNativeWebViewInfo>;
   };
+  /** Manage generic native views and WebView-backed views inside the calling native window. */
+  views: {
+    create(options: ZeroNativeCreateViewOptions): Promise<ZeroNativeViewHandle>;
+    list(): Promise<ZeroNativeViewInfo[]>;
+    update(options: ZeroNativeUpdateViewOptions): Promise<ZeroNativeViewHandle>;
+    setFrame(options: ZeroNativeSetViewFrameOptions): Promise<ZeroNativeViewHandle>;
+    setVisible(options: ZeroNativeSetViewVisibleOptions): Promise<ZeroNativeViewHandle>;
+    focus(options: ZeroNativeViewSelector): Promise<ZeroNativeViewHandle>;
+    close(options: ZeroNativeViewSelector): Promise<ZeroNativeViewInfo>;
+  };
   dialogs: {
     openFile(options?: ZeroNativeOpenFileOptions): Promise<string[] | null>;
     saveFile(options?: ZeroNativeSaveFileOptions): Promise<string | null>;
     showMessage(options?: ZeroNativeMessageDialogOptions): Promise<"primary" | "secondary" | "tertiary">;
+  };
+  os: {
+    openUrl(value: string | ZeroNativeOpenUrlOptions): Promise<boolean>;
+    showNotification(value: string | ZeroNativeNotificationOptions): Promise<boolean>;
+    revealPath(value: string | ZeroNativeRevealPathOptions): Promise<boolean>;
+    addRecentDocument(value: string | ZeroNativeRecentDocumentOptions): Promise<boolean>;
+    clearRecentDocuments(): Promise<boolean>;
+  };
+  credentials: {
+    set(options: ZeroNativeSetCredentialOptions): Promise<boolean>;
+    get(options: ZeroNativeCredentialKey): Promise<string | null>;
+    delete(options: ZeroNativeCredentialKey): Promise<boolean>;
   };
 }
 

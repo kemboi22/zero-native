@@ -20,14 +20,8 @@ const WebEngineOption = enum {
     chromium,
 };
 
-const PackageTarget = enum {
-    macos,
-    windows,
-    linux,
-};
-
-const default_zero_native_path = "../..";
-const app_exe_name = "next";
+const default_zero_native_path = "../../";
+const app_exe_name = "native-shell";
 
 pub fn build(b: *std.Build) void {
     const target = zeroNativeTarget(b);
@@ -40,9 +34,7 @@ pub fn build(b: *std.Build) void {
     const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
     const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
     const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
-    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
     const zero_native_path = b.option([]const u8, "zero-native-path", "Path to the zero-native framework checkout") orelse default_zero_native_path;
-    const optimize_name = @tagName(optimize);
     const selected_platform: PlatformOption = switch (platform_option) {
         .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .null,
         else => platform_option,
@@ -95,50 +87,10 @@ pub fn build(b: *std.Build) void {
     linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, zero_native_path, cef_dir, cef_auto_install);
     b.installArtifact(exe);
 
-    const frontend_install = b.addSystemCommand(&.{ "npm", "install", "--prefix", "frontend" });
-    const frontend_install_step = b.step("frontend-install", "Install frontend dependencies");
-    frontend_install_step.dependOn(&frontend_install.step);
-
-    const frontend_build = b.addSystemCommand(&.{ "npm", "--prefix", "frontend", "run", "build" });
-    frontend_build.step.dependOn(&frontend_install.step);
-    const frontend_step = b.step("frontend-build", "Build the frontend");
-    frontend_step.dependOn(&frontend_build.step);
-
     const run = b.addRunArtifact(exe);
-    run.step.dependOn(&frontend_build.step);
     addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run.step);
-
-    const dev = b.addSystemCommand(&.{ "zero-native", "dev", "--manifest", "app.zon", "--binary" });
-    dev.addFileArg(exe.getEmittedBin());
-    dev.step.dependOn(&exe.step);
-    dev.step.dependOn(&frontend_install.step);
-    const dev_step = b.step("dev", "Run the frontend dev server and native shell");
-    dev_step.dependOn(&dev.step);
-
-    const package = b.addSystemCommand(&.{
-        "zero-native",
-        "package",
-        "--target",
-        @tagName(package_target),
-        "--manifest",
-        "app.zon",
-        "--assets",
-        "frontend/out",
-        "--optimize",
-        optimize_name,
-        "--output",
-        b.fmt("zig-out/package/{s}-0.1.0-{s}-{s}{s}", .{ app_exe_name, @tagName(package_target), optimize_name, packageSuffix(package_target) }),
-        "--binary",
-    });
-    package.addFileArg(exe.getEmittedBin());
-    package.addArgs(&.{ "--web-engine", @tagName(web_engine), "--cef-dir", cef_dir });
-    if (cef_auto_install) package.addArg("--cef-auto-install");
-    package.step.dependOn(&exe.step);
-    package.step.dependOn(&frontend_build.step);
-    const package_step = b.step("package", "Create a local package artifact");
-    package_step.dependOn(&package.step);
 
     const tests = b.addTest(.{ .root_module = app_mod });
     const test_step = b.step("test", "Run tests");
@@ -340,16 +292,10 @@ fn addCefCheck(b: *std.Build, target: std.Build.ResolvedTarget, cef_dir: []const
             \\test -d "{s}/Release/Chromium Embedded Framework.framework" &&
             \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
             \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
-            \\  echo "Expected:" >&2
-            \\  echo "  {s}/include/cef_app.h" >&2
-            \\  echo "  {s}/Release/Chromium Embedded Framework.framework" >&2
-            \\  echo "  {s}/libcef_dll_wrapper/libcef_dll_wrapper.a" >&2
             \\  echo "Fix with: zero-native cef install --dir {s}" >&2
-            \\  echo "Or rerun with: -Dcef-auto-install=true" >&2
-            \\  echo "Pass -Dcef-dir=/path/to/cef if your bundle lives elsewhere." >&2
             \\  exit 1
             \\}}
-        , .{ cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir }),
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
         .linux => b.fmt(
             \\test -f "{s}/include/cef_app.h" &&
             \\test -f "{s}/Release/libcef.so" &&
@@ -371,13 +317,6 @@ fn addCefCheck(b: *std.Build, target: std.Build.ResolvedTarget, cef_dir: []const
         else => "echo unsupported CEF target >&2; exit 1",
     };
     return b.addSystemCommand(&.{ "sh", "-c", script });
-}
-
-fn packageSuffix(target: PackageTarget) []const u8 {
-    return switch (target) {
-        .macos => ".app",
-        .windows, .linux => "",
-    };
 }
 
 const AppWebEngineConfig = struct {

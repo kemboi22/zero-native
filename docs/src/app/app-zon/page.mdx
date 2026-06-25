@@ -12,12 +12,13 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     .version = "0.1.0",
     .icons = .{ "assets/icon.icns", "assets/icon.ico" },
     .platforms = .{ "macos" },
-    .permissions = .{ "window" },
-    .capabilities = .{ "webview", "js_bridge" },
+    .permissions = .{ "window", "credentials" },
+    .capabilities = .{ "webview", "js_bridge", "credentials" },
     .bridge = .{
         .commands = .{
             .{ .name = "native.ping", .origins = .{ "zero://app" } },
             .{ .name = "zero-native.window.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
+            .{ .name = "zero-native.credentials.get", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
         },
     },
     .security = .{
@@ -33,6 +34,17 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     },
     .shortcuts = .{
         .{ .id = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
+    },
+    .file_associations = .{
+        .{
+            .name = "Markdown Document",
+            .extensions = .{ "md", ".markdown" },
+            .mime_types = .{ "text/markdown" },
+            .icon = "assets/markdown.icns",
+        },
+    },
+    .url_schemes = .{
+        .{ .scheme = "zero-native" },
     },
 }
 ```
@@ -100,8 +112,20 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
       <td>Window definitions (see <a href="/windows">Windows</a>)</td>
     </tr>
     <tr>
+      <td><code>shell</code></td>
+      <td>Native-first window and view tree declarations</td>
+    </tr>
+    <tr>
       <td><code>shortcuts</code></td>
       <td>Keyboard shortcuts delivered as <code>shortcut</code> events (see <a href="/keyboard-shortcuts">Keyboard Shortcuts</a>)</td>
+    </tr>
+    <tr>
+      <td><code>file_associations</code></td>
+      <td>File type registration metadata for packaging</td>
+    </tr>
+    <tr>
+      <td><code>url_schemes</code></td>
+      <td>Custom URL scheme registration metadata for packaging</td>
     </tr>
     <tr>
       <td><code>frontend</code></td>
@@ -109,6 +133,37 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     </tr>
   </tbody>
 </table>
+
+## `shell`
+
+The optional `shell` block declares native-first windows with explicit view trees. Existing `windows` entries remain the simple compatibility path; `shell.windows` is the richer contract for native chrome, native controls, WebViews, and future GPU surfaces.
+
+Tooling parses and validates the schema. Runtime code can materialize a parsed shell window with `runtime.createShellWindow(...)` or attach a shell view list to an existing window with `runtime.createShellViews(...)`; platform hosts implement view kinds progressively, so unsupported native kinds fail at runtime with an explicit unsupported error until that backend grows support.
+
+```zig
+.shell = .{
+    .windows = .{
+        .{
+            .label = "main",
+            .title = "Acme",
+            .width = 1100,
+            .height = 760,
+            .views = .{
+                .{ .label = "toolbar", .kind = "toolbar", .edge = "top", .height = 44, .role = "toolbar" },
+                .{ .label = "sidebar", .kind = "webview", .url = "zero://app/sidebar.html", .edge = "left", .width = 280 },
+                .{ .label = "content", .kind = "webview", .url = "zero://app/index.html", .fill = true },
+                .{ .label = "status", .kind = "statusbar", .edge = "bottom", .height = 24, .text = "Ready" },
+            },
+        },
+    },
+},
+```
+
+Supported `kind` values are `webview`, `toolbar`, `titlebar_accessory`, `sidebar`, `statusbar`, `split`, `stack`, `button`, `checkbox`, `toggle`, `text_field`, `search_field`, `label`, `spacer`, and `gpu_surface`.
+
+Each view has a required `label` and `kind`. WebView views require `url`. Optional layout fields are `parent`, `edge`, `x`, `y`, `width`, `height`, `fill`, and `layer`. Optional behavior and accessibility metadata are `visible`, `enabled`, `role`, `text`, and `command`.
+
+`createShellWindow` and `createShellViews` dock `edge` views against the remaining window content, let one or more `fill` views use the final remaining rectangle, and lay out parented controls such as toolbar buttons with small native defaults when explicit `x`, `y`, `width`, or `height` values are omitted. The runtime keeps the shell view slice as a layout binding and reapplies it when the window is resized, so pass data that lives for the lifetime of the window.
 
 ## `shortcuts`
 
@@ -128,6 +183,31 @@ Single-character keys and text-entry keys (`enter`, `tab`, `space`, and `backspa
 An app can define up to 64 shortcuts. Shortcut ids can be up to 64 bytes and keys can be up to 32 bytes.
 
 Linux Chromium builds currently reject non-empty `shortcuts`; use the Linux system WebView backend when an app needs native shortcut events.
+
+## File associations and URL schemes
+
+The optional `file_associations` and `url_schemes` lists declare packaging metadata for document types and custom protocols:
+
+```zig
+.file_associations = .{
+    .{
+        .name = "Markdown Document",
+        .role = "editor",
+        .extensions = .{ "md", ".markdown" },
+        .mime_types = .{ "text/markdown" },
+        .icon = "assets/markdown.icns",
+    },
+},
+.url_schemes = .{
+    .{ .scheme = "acme-notes" },
+},
+```
+
+File associations require a `name` and at least one `extensions` or `mime_types` entry. Extensions may include a leading dot, but packaging tools treat the extension as the same value either way. `icon` is optional and must be a relative path.
+
+URL schemes require a lowercase custom `scheme`. Reserved schemes such as `http`, `https`, and `file` are rejected.
+
+`role` defaults to `viewer` and accepts `viewer`, `editor`, `shell`, or `none`. The metadata is parsed and validated today; platform package generation currently treats registration as unsupported until the macOS, Windows, and Linux packagers emit the native Info.plist, registry, and desktop-file entries.
 
 ## `frontend.dev`
 

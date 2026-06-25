@@ -24,7 +24,10 @@ pub const Metadata = struct {
     frontend: ?FrontendMetadata = null,
     security: SecurityMetadata = .{},
     windows: []const WindowMetadata = &.{},
+    shell: ShellMetadata = .{},
     shortcuts: []const ShortcutMetadata = &.{},
+    file_associations: []const FileAssociationMetadata = &.{},
+    url_schemes: []const UrlSchemeMetadata = &.{},
 
     pub fn displayName(self: Metadata) []const u8 {
         return self.display_name orelse self.name;
@@ -75,6 +78,23 @@ pub const Metadata = struct {
             if (window.title) |title| allocator.free(title);
         }
         if (self.windows.len > 0) allocator.free(self.windows);
+        for (self.shell.windows) |window| {
+            allocator.free(window.label);
+            if (window.title) |title| allocator.free(title);
+            allocator.free(window.restore_policy);
+            for (window.views) |view| {
+                allocator.free(view.label);
+                allocator.free(view.kind);
+                if (view.parent) |parent| allocator.free(parent);
+                if (view.edge) |edge| allocator.free(edge);
+                if (view.role) |role| allocator.free(role);
+                if (view.url) |url| allocator.free(url);
+                if (view.text) |text| allocator.free(text);
+                if (view.command) |command| allocator.free(command);
+            }
+            if (window.views.len > 0) allocator.free(window.views);
+        }
+        if (self.shell.windows.len > 0) allocator.free(self.shell.windows);
         for (self.shortcuts) |shortcut| {
             allocator.free(shortcut.id);
             allocator.free(shortcut.key);
@@ -82,6 +102,21 @@ pub const Metadata = struct {
             if (shortcut.modifiers.len > 0) allocator.free(shortcut.modifiers);
         }
         if (self.shortcuts.len > 0) allocator.free(self.shortcuts);
+        for (self.file_associations) |association| {
+            allocator.free(association.name);
+            allocator.free(association.role);
+            for (association.extensions) |value| allocator.free(value);
+            if (association.extensions.len > 0) allocator.free(association.extensions);
+            for (association.mime_types) |value| allocator.free(value);
+            if (association.mime_types.len > 0) allocator.free(association.mime_types);
+            if (association.icon) |icon| allocator.free(icon);
+        }
+        if (self.file_associations.len > 0) allocator.free(self.file_associations);
+        for (self.url_schemes) |scheme| {
+            allocator.free(scheme.scheme);
+            allocator.free(scheme.role);
+        }
+        if (self.url_schemes.len > 0) allocator.free(self.url_schemes);
     }
 };
 
@@ -101,10 +136,59 @@ pub const WindowMetadata = struct {
     restore_state: bool = true,
 };
 
+pub const ShellMetadata = struct {
+    windows: []const ShellWindowMetadata = &.{},
+};
+
+pub const ShellWindowMetadata = struct {
+    label: []const u8 = "main",
+    title: ?[]const u8 = null,
+    width: f32 = 720,
+    height: f32 = 480,
+    x: ?f32 = null,
+    y: ?f32 = null,
+    resizable: bool = true,
+    restore_state: bool = true,
+    restore_policy: []const u8 = "clamp_to_visible_screen",
+    views: []const ShellViewMetadata = &.{},
+};
+
+pub const ShellViewMetadata = struct {
+    label: []const u8,
+    kind: []const u8,
+    parent: ?[]const u8 = null,
+    edge: ?[]const u8 = null,
+    x: ?f32 = null,
+    y: ?f32 = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
+    fill: bool = false,
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+};
+
 pub const ShortcutMetadata = struct {
     id: []const u8,
     key: []const u8,
     modifiers: []const []const u8 = &.{},
+};
+
+pub const FileAssociationMetadata = struct {
+    name: []const u8,
+    role: []const u8 = "viewer",
+    extensions: []const []const u8 = &.{},
+    mime_types: []const []const u8 = &.{},
+    icon: ?[]const u8 = null,
+};
+
+pub const UrlSchemeMetadata = struct {
+    scheme: []const u8,
+    role: []const u8 = "viewer",
 };
 
 pub const FrontendDevMetadata = struct {
@@ -144,7 +228,12 @@ const RawSecurity = raw_manifest.RawSecurity;
 const RawNavigation = raw_manifest.RawNavigation;
 const RawExternalLinks = raw_manifest.RawExternalLinks;
 const RawWindow = raw_manifest.RawWindow;
+const RawShell = raw_manifest.RawShell;
+const RawShellWindow = raw_manifest.RawShellWindow;
+const RawShellView = raw_manifest.RawShellView;
 const RawShortcut = raw_manifest.RawShortcut;
+const RawFileAssociation = raw_manifest.RawFileAssociation;
+const RawUrlScheme = raw_manifest.RawUrlScheme;
 
 pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !ValidationResult {
     const source = try readFile(allocator, io, path);
@@ -167,8 +256,14 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     const security = convertSecurity(metadata.security) catch return .{ .ok = false, .message = "app.zon security policy is invalid" };
     const windows = try convertWindows(allocator, metadata.windows);
     defer allocator.free(windows);
+    const shell = parseShell(allocator, metadata.shell) catch return .{ .ok = false, .message = "app.zon shell is invalid" };
+    defer deinitParsedShell(allocator, shell);
     const shortcuts = parseShortcuts(allocator, metadata.shortcuts) catch return .{ .ok = false, .message = "app.zon shortcuts are invalid" };
     defer allocator.free(shortcuts);
+    const file_associations = parseFileAssociations(allocator, metadata.file_associations) catch return .{ .ok = false, .message = "app.zon file associations are invalid" };
+    defer allocator.free(file_associations);
+    const url_schemes = parseUrlSchemes(allocator, metadata.url_schemes) catch return .{ .ok = false, .message = "app.zon URL schemes are invalid" };
+    defer allocator.free(url_schemes);
     const manifest_web_engine = parseWebEngine(metadata.web_engine) catch return .{ .ok = false, .message = "app.zon web engine is invalid" };
 
     const manifest: app_manifest.Manifest = .{
@@ -181,7 +276,10 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         .security = security,
         .platforms = parsePlatformSettings(allocator, metadata.platforms) catch return .{ .ok = false, .message = "app.zon platforms are invalid" },
         .windows = windows,
+        .shell = shell,
         .shortcuts = shortcuts,
+        .file_associations = file_associations,
+        .url_schemes = url_schemes,
         .cef = .{ .dir = metadata.cef.dir, .auto_install = metadata.cef.auto_install },
         .package = .{ .web_engine = manifest_web_engine },
     };
@@ -219,8 +317,15 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Metadata {
         .frontend = try convertRawFrontend(allocator, raw.frontend),
         .security = try convertRawSecurity(allocator, raw.security),
         .windows = try convertRawWindows(allocator, raw.windows),
+        .shell = try convertRawShell(allocator, raw.shell),
         .shortcuts = try convertRawShortcuts(allocator, raw.shortcuts),
+        .file_associations = try convertRawFileAssociations(allocator, raw.file_associations),
+        .url_schemes = try convertRawUrlSchemes(allocator, raw.url_schemes),
     };
+}
+
+fn duplicateOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |payload| try allocator.dupe(u8, payload) else null;
 }
 
 fn duplicateStringList(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
@@ -294,6 +399,56 @@ fn convertRawWindows(allocator: std.mem.Allocator, windows: []const RawWindow) !
     return converted;
 }
 
+fn convertRawShell(allocator: std.mem.Allocator, shell: RawShell) !ShellMetadata {
+    return .{ .windows = try convertRawShellWindows(allocator, shell.windows) };
+}
+
+fn convertRawShellWindows(allocator: std.mem.Allocator, windows: []const RawShellWindow) ![]const ShellWindowMetadata {
+    if (windows.len == 0) return &.{};
+    const converted = try allocator.alloc(ShellWindowMetadata, windows.len);
+    for (windows, 0..) |window, index| {
+        converted[index] = .{
+            .label = try allocator.dupe(u8, window.label),
+            .title = try duplicateOptionalString(allocator, window.title),
+            .width = window.width,
+            .height = window.height,
+            .x = window.x,
+            .y = window.y,
+            .resizable = window.resizable,
+            .restore_state = window.restore_state,
+            .restore_policy = try allocator.dupe(u8, window.restore_policy),
+            .views = try convertRawShellViews(allocator, window.views),
+        };
+    }
+    return converted;
+}
+
+fn convertRawShellViews(allocator: std.mem.Allocator, views: []const RawShellView) ![]const ShellViewMetadata {
+    if (views.len == 0) return &.{};
+    const converted = try allocator.alloc(ShellViewMetadata, views.len);
+    for (views, 0..) |view, index| {
+        converted[index] = .{
+            .label = try allocator.dupe(u8, view.label),
+            .kind = try allocator.dupe(u8, view.kind),
+            .parent = try duplicateOptionalString(allocator, view.parent),
+            .edge = try duplicateOptionalString(allocator, view.edge),
+            .x = view.x,
+            .y = view.y,
+            .width = view.width,
+            .height = view.height,
+            .fill = view.fill,
+            .layer = view.layer,
+            .visible = view.visible,
+            .enabled = view.enabled,
+            .role = try duplicateOptionalString(allocator, view.role),
+            .url = try duplicateOptionalString(allocator, view.url),
+            .text = try duplicateOptionalString(allocator, view.text),
+            .command = try duplicateOptionalString(allocator, view.command),
+        };
+    }
+    return converted;
+}
+
 fn convertRawShortcuts(allocator: std.mem.Allocator, shortcuts: []const RawShortcut) ![]const ShortcutMetadata {
     if (shortcuts.len == 0) return &.{};
     const converted = try allocator.alloc(ShortcutMetadata, shortcuts.len);
@@ -302,6 +457,33 @@ fn convertRawShortcuts(allocator: std.mem.Allocator, shortcuts: []const RawShort
             .id = try allocator.dupe(u8, shortcut.id),
             .key = try allocator.dupe(u8, shortcut.key),
             .modifiers = try duplicateStringList(allocator, shortcut.modifiers),
+        };
+    }
+    return converted;
+}
+
+fn convertRawFileAssociations(allocator: std.mem.Allocator, associations: []const RawFileAssociation) ![]const FileAssociationMetadata {
+    if (associations.len == 0) return &.{};
+    const converted = try allocator.alloc(FileAssociationMetadata, associations.len);
+    for (associations, 0..) |association, index| {
+        converted[index] = .{
+            .name = try allocator.dupe(u8, association.name),
+            .role = try allocator.dupe(u8, association.role),
+            .extensions = try duplicateStringList(allocator, association.extensions),
+            .mime_types = try duplicateStringList(allocator, association.mime_types),
+            .icon = try duplicateOptionalString(allocator, association.icon),
+        };
+    }
+    return converted;
+}
+
+fn convertRawUrlSchemes(allocator: std.mem.Allocator, schemes: []const RawUrlScheme) ![]const UrlSchemeMetadata {
+    if (schemes.len == 0) return &.{};
+    const converted = try allocator.alloc(UrlSchemeMetadata, schemes.len);
+    for (schemes, 0..) |scheme, index| {
+        converted[index] = .{
+            .scheme = try allocator.dupe(u8, scheme.scheme),
+            .role = try allocator.dupe(u8, scheme.role),
         };
     }
     return converted;
@@ -379,6 +561,69 @@ fn convertWindows(allocator: std.mem.Allocator, windows: []const WindowMetadata)
     return converted;
 }
 
+fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.ShellConfig {
+    if (shell.windows.len == 0) return .{};
+    const windows = try allocator.alloc(app_manifest.ShellWindow, shell.windows.len);
+    errdefer allocator.free(windows);
+    var initialized: usize = 0;
+    errdefer {
+        for (windows[0..initialized]) |window| {
+            if (window.views.len > 0) allocator.free(window.views);
+        }
+    }
+    for (shell.windows, 0..) |window, index| {
+        const views = try parseShellViews(allocator, window.views);
+        windows[index] = .{
+            .label = window.label,
+            .title = window.title,
+            .width = window.width,
+            .height = window.height,
+            .x = window.x,
+            .y = window.y,
+            .resizable = window.resizable,
+            .restore_state = window.restore_state,
+            .restore_policy = try parseRestorePolicy(window.restore_policy),
+            .views = views,
+        };
+        initialized += 1;
+    }
+    return .{ .windows = windows };
+}
+
+fn parseShellViews(allocator: std.mem.Allocator, values: []const ShellViewMetadata) ![]const app_manifest.ShellView {
+    if (values.len == 0) return &.{};
+    const views = try allocator.alloc(app_manifest.ShellView, values.len);
+    errdefer allocator.free(views);
+    for (values, 0..) |view, index| {
+        views[index] = .{
+            .label = view.label,
+            .kind = try parseViewKind(view.kind),
+            .parent = view.parent,
+            .edge = if (view.edge) |edge| try parseShellEdge(edge) else null,
+            .x = view.x,
+            .y = view.y,
+            .width = view.width,
+            .height = view.height,
+            .fill = view.fill,
+            .layer = view.layer,
+            .visible = view.visible,
+            .enabled = view.enabled,
+            .role = view.role,
+            .url = view.url,
+            .text = view.text,
+            .command = view.command,
+        };
+    }
+    return views;
+}
+
+fn deinitParsedShell(allocator: std.mem.Allocator, shell: app_manifest.ShellConfig) void {
+    for (shell.windows) |window| {
+        if (window.views.len > 0) allocator.free(window.views);
+    }
+    if (shell.windows.len > 0) allocator.free(shell.windows);
+}
+
 fn validateIconPaths(icons: []const []const u8) !void {
     for (icons, 0..) |icon, index| {
         try validateRelativePath(icon);
@@ -415,6 +660,7 @@ fn parsePermission(value: []const u8) app_manifest.Permission {
     if (std.mem.eql(u8, value, "notifications")) return .notifications;
     if (std.mem.eql(u8, value, "clipboard")) return .clipboard;
     if (std.mem.eql(u8, value, "window")) return .window;
+    if (std.mem.eql(u8, value, "credentials")) return .credentials;
     return .{ .custom = value };
 }
 
@@ -424,7 +670,9 @@ fn parseCapability(value: []const u8) !app_manifest.Capability {
     if (std.mem.eql(u8, value, "js_bridge")) return .js_bridge;
     if (std.mem.eql(u8, value, "filesystem")) return .filesystem;
     if (std.mem.eql(u8, value, "network")) return .network;
+    if (std.mem.eql(u8, value, "notifications")) return .notifications;
     if (std.mem.eql(u8, value, "clipboard")) return .clipboard;
+    if (std.mem.eql(u8, value, "credentials")) return .credentials;
     return error.InvalidCapability;
 }
 
@@ -453,6 +701,43 @@ fn parseShortcuts(allocator: std.mem.Allocator, values: []const ShortcutMetadata
         });
     }
     return shortcuts.toOwnedSlice(allocator);
+}
+
+fn parseFileAssociations(allocator: std.mem.Allocator, values: []const FileAssociationMetadata) ![]const app_manifest.FileAssociation {
+    if (values.len == 0) return &.{};
+    var associations: std.ArrayList(app_manifest.FileAssociation) = .empty;
+    errdefer associations.deinit(allocator);
+    for (values) |value| {
+        try associations.append(allocator, .{
+            .name = value.name,
+            .role = try parseAssociationRole(value.role),
+            .extensions = value.extensions,
+            .mime_types = value.mime_types,
+            .icon = value.icon,
+        });
+    }
+    return associations.toOwnedSlice(allocator);
+}
+
+fn parseUrlSchemes(allocator: std.mem.Allocator, values: []const UrlSchemeMetadata) ![]const app_manifest.UrlScheme {
+    if (values.len == 0) return &.{};
+    var schemes: std.ArrayList(app_manifest.UrlScheme) = .empty;
+    errdefer schemes.deinit(allocator);
+    for (values) |value| {
+        try schemes.append(allocator, .{
+            .scheme = value.scheme,
+            .role = try parseAssociationRole(value.role),
+        });
+    }
+    return schemes.toOwnedSlice(allocator);
+}
+
+fn parseAssociationRole(value: []const u8) !app_manifest.AssociationRole {
+    if (std.mem.eql(u8, value, "viewer")) return .viewer;
+    if (std.mem.eql(u8, value, "editor")) return .editor;
+    if (std.mem.eql(u8, value, "shell")) return .shell;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    return error.InvalidAssociationRole;
 }
 
 fn parseShortcutModifiers(values: []const []const u8) !app_manifest.ShortcutModifiers {
@@ -501,6 +786,39 @@ fn parseExternalLinkAction(value: []const u8) !app_manifest.ExternalLinkAction {
     return error.InvalidAction;
 }
 
+fn parseRestorePolicy(value: []const u8) !app_manifest.WindowRestorePolicy {
+    if (std.mem.eql(u8, value, "clamp_to_visible_screen")) return .clamp_to_visible_screen;
+    if (std.mem.eql(u8, value, "center_on_primary")) return .center_on_primary;
+    return error.InvalidWindowRestorePolicy;
+}
+
+fn parseViewKind(value: []const u8) !app_manifest.ViewKind {
+    if (std.mem.eql(u8, value, "webview")) return .webview;
+    if (std.mem.eql(u8, value, "toolbar")) return .toolbar;
+    if (std.mem.eql(u8, value, "titlebar_accessory")) return .titlebar_accessory;
+    if (std.mem.eql(u8, value, "sidebar")) return .sidebar;
+    if (std.mem.eql(u8, value, "statusbar")) return .statusbar;
+    if (std.mem.eql(u8, value, "split")) return .split;
+    if (std.mem.eql(u8, value, "stack")) return .stack;
+    if (std.mem.eql(u8, value, "button")) return .button;
+    if (std.mem.eql(u8, value, "checkbox")) return .checkbox;
+    if (std.mem.eql(u8, value, "toggle")) return .toggle;
+    if (std.mem.eql(u8, value, "text_field")) return .text_field;
+    if (std.mem.eql(u8, value, "search_field")) return .search_field;
+    if (std.mem.eql(u8, value, "label")) return .label;
+    if (std.mem.eql(u8, value, "spacer")) return .spacer;
+    if (std.mem.eql(u8, value, "gpu_surface")) return .gpu_surface;
+    return error.InvalidViewKind;
+}
+
+fn parseShellEdge(value: []const u8) !app_manifest.ShellEdge {
+    if (std.mem.eql(u8, value, "top")) return .top;
+    if (std.mem.eql(u8, value, "right")) return .right;
+    if (std.mem.eql(u8, value, "bottom")) return .bottom;
+    if (std.mem.eql(u8, value, "left")) return .left;
+    return error.InvalidLayout;
+}
+
 fn parseWebEngine(value: []const u8) !app_manifest.WebEngine {
     if (std.mem.eql(u8, value, "system")) return .system;
     if (std.mem.eql(u8, value, "chromium")) return .chromium;
@@ -541,12 +859,18 @@ test "manifest metadata parser reads identity version and lists" {
         \\  .version = "1.2.3",
         \\  .icons = .{ "assets/icon.png" },
         \\  .platforms = .{ "macos", "linux" },
-        \\  .capabilities = .{ "native_module", "webview", "js_bridge" },
+        \\  .capabilities = .{ "native_module", "webview", "js_bridge", "credentials" },
         \\  .bridge = .{ .commands = .{ .{ .name = "native.ping" } } },
         \\  .web_engine = "chromium",
         \\  .cef = .{ .dir = "third_party/cef/macos", .auto_install = true },
         \\  .shortcuts = .{
         \\    .{ .id = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
+        \\  },
+        \\  .file_associations = .{
+        \\    .{ .name = "Markdown Document", .extensions = .{ "md", ".markdown" }, .mime_types = .{ "text/markdown" }, .icon = "assets/markdown.icns" },
+        \\  },
+        \\  .url_schemes = .{
+        \\    .{ .scheme = "example-app" },
         \\  },
         \\}
     );
@@ -559,13 +883,30 @@ test "manifest metadata parser reads identity version and lists" {
     try std.testing.expectEqualStrings("assets/icon.png", metadata.icons[0]);
     try std.testing.expectEqualStrings("linux", metadata.platforms[1]);
     try std.testing.expectEqualStrings("webview", metadata.capabilities[1]);
+    try std.testing.expectEqualStrings("credentials", metadata.capabilities[3]);
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
     try std.testing.expectEqualStrings("command.palette", metadata.shortcuts[0].id);
     try std.testing.expectEqualStrings("primary", metadata.shortcuts[0].modifiers[0]);
+    try std.testing.expectEqualStrings("Markdown Document", metadata.file_associations[0].name);
+    try std.testing.expectEqualStrings(".markdown", metadata.file_associations[0].extensions[1]);
+    try std.testing.expectEqualStrings("text/markdown", metadata.file_associations[0].mime_types[0]);
+    try std.testing.expectEqualStrings("assets/markdown.icns", metadata.file_associations[0].icon.?);
+    try std.testing.expectEqualStrings("example-app", metadata.url_schemes[0].scheme);
     try std.testing.expectEqualStrings("chromium", metadata.web_engine);
     try std.testing.expectEqualStrings("third_party/cef/macos", metadata.cef.dir);
     try std.testing.expect(metadata.cef.auto_install);
     try std.testing.expectEqual(@as(u32, 2), (try parseVersion(metadata.version)).minor);
+
+    const associations = try parseFileAssociations(std.testing.allocator, metadata.file_associations);
+    defer std.testing.allocator.free(associations);
+    const schemes = try parseUrlSchemes(std.testing.allocator, metadata.url_schemes);
+    defer std.testing.allocator.free(schemes);
+    try app_manifest.validateManifest(.{
+        .identity = .{ .id = metadata.id, .name = metadata.name },
+        .version = try parseVersion(metadata.version),
+        .file_associations = associations,
+        .url_schemes = schemes,
+    });
 }
 
 test "manifest metadata parser reads structured security policy" {
@@ -574,7 +915,7 @@ test "manifest metadata parser reads structured security policy" {
         \\  .id = "com.example.app",
         \\  .name = "example",
         \\  .version = "1.2.3",
-        \\  .permissions = .{ "window", "filesystem" },
+        \\  .permissions = .{ "window", "filesystem", "credentials" },
         \\  .bridge = .{
         \\    .commands = .{
         \\      .{ .name = "native.ping", .permissions = .{ "filesystem" }, .origins = .{ "zero://app" } },
@@ -594,12 +935,76 @@ test "manifest metadata parser reads structured security policy" {
     defer metadata.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("window", metadata.permissions[0]);
+    try std.testing.expectEqualStrings("credentials", metadata.permissions[2]);
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
     try std.testing.expectEqualStrings("filesystem", metadata.bridge_commands[0].permissions[0]);
     try std.testing.expectEqualStrings("zero://app", metadata.bridge_commands[0].origins[0]);
     try std.testing.expectEqualStrings("http://127.0.0.1:5173", metadata.security.navigation.allowed_origins[1]);
     try std.testing.expectEqualStrings("open_system_browser", metadata.security.navigation.external_links.action);
     try std.testing.expectEqualStrings("https://example.com/*", metadata.security.navigation.external_links.allowed_urls[0]);
+}
+
+test "manifest metadata parser reads shell windows and views" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{
+        \\        .label = "main",
+        \\        .title = "Example",
+        \\        .width = 1100,
+        \\        .height = 760,
+        \\        .restore_policy = "center_on_primary",
+        \\        .views = .{
+        \\          .{ .label = "toolbar", .kind = "toolbar", .edge = "top", .height = 44, .role = "toolbar" },
+        \\          .{ .label = "content", .kind = "webview", .url = "zero://app/index.html", .fill = true },
+        \\          .{ .label = "status", .kind = "statusbar", .edge = "bottom", .height = 24, .text = "Ready" },
+        \\          .{ .label = "save", .kind = "button", .parent = "toolbar", .text = "Save", .command = "app.save" },
+        \\        },
+        \\      },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("main", metadata.shell.windows[0].label);
+    try std.testing.expectEqualStrings("center_on_primary", metadata.shell.windows[0].restore_policy);
+    try std.testing.expectEqualStrings("toolbar", metadata.shell.windows[0].views[0].kind);
+    try std.testing.expectEqualStrings("zero://app/index.html", metadata.shell.windows[0].views[1].url.?);
+    try std.testing.expect(metadata.shell.windows[0].views[1].fill);
+    try std.testing.expectEqualStrings("app.save", metadata.shell.windows[0].views[3].command.?);
+
+    const shell = try parseShell(std.testing.allocator, metadata.shell);
+    defer deinitParsedShell(std.testing.allocator, shell);
+    try std.testing.expectEqual(app_manifest.ViewKind.webview, shell.windows[0].views[1].kind);
+    try std.testing.expectEqual(app_manifest.ShellEdge.top, shell.windows[0].views[0].edge.?);
+    try app_manifest.validateManifest(.{
+        .identity = .{ .id = metadata.id, .name = metadata.name },
+        .version = try parseVersion(metadata.version),
+        .shell = shell,
+    });
+}
+
+test "manifest parser rejects invalid shell view kind" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .views = .{ .{ .label = "content", .kind = "unknown", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidViewKind, parseShell(std.testing.allocator, metadata.shell));
 }
 
 test "manifest metadata parser reads frontend config" {

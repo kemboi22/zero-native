@@ -1,6 +1,6 @@
 # System Tray
 
-zero-native supports system tray icons with menus. Tray actions dispatch as `CommandEvent` with name `"tray.action"` in the runtime.
+zero-native supports system tray icons with menus. Tray actions dispatch as `CommandEvent` with name `"tray.action"` and source `.tray` in the runtime.
 
 Tray support is currently implemented on macOS. Linux returns `UnsupportedService` until a portable status notifier implementation is selected.
 
@@ -75,7 +75,7 @@ Tray support is currently implemented on macOS. Linux returns `UnsupportedServic
 
 ## Handling tray actions
 
-When a user clicks a tray menu item, the runtime dispatches a `CommandEvent` with the name `"tray.action"`. Use your `event_fn` to handle it:
+When a user clicks a tray menu item, the runtime dispatches a `CommandEvent` with the name `"tray.action"` and source `.tray`. Use your `event_fn` to handle it:
 
 ```zig
 fn event(context: *anyopaque, runtime: *Runtime, ev: Event) anyerror!void {

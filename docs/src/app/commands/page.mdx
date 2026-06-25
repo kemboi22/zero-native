@@ -1,0 +1,61 @@
+# Commands
+
+Commands are the shared routing layer for native app actions. Menus, shortcuts, toolbar controls, tray items, native controls, bridge calls, and runtime code can all dispatch the same command name into `Event.command`.
+
+```zig
+fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {
+    _ = context;
+    switch (event_value) {
+        .command => |command| {
+            if (std.mem.eql(u8, command.name, "app.refresh")) {
+                try runtime.updateView(command.window_id, "status", .{
+                    .role = "Refreshed",
+                });
+            }
+        },
+        else => {},
+    }
+}
+```
+
+## Sources
+
+`CommandEvent.source` identifies where the action came from:
+
+| Source | Emitted by |
+| --- | --- |
+| `.runtime` | Direct `runtime.dispatchCommand(...)` calls |
+| `.menu` | Native menu items |
+| `.shortcut` | Native keyboard shortcuts |
+| `.toolbar` | Native controls inside a toolbar view |
+| `.tray` | Tray actions |
+| `.native_view` | Native controls outside toolbar views |
+| `.bridge` | `window.zero.commands.invoke(...)` |
+
+Use `command.name` for the action and `command.source` only when the app genuinely needs source-specific behavior.
+
+## Command names
+
+Command names are stable IDs, not display labels. Use namespaced lowercase IDs:
+
+```zig
+const shortcuts = [_]zero_native.Shortcut{
+    .{ .id = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
+};
+
+const view_items = [_]zero_native.MenuItem{
+    .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
+};
+```
+
+The same command can be bound to a menu item, shortcut, toolbar button, and bridge call. The runtime validates command IDs and rejects empty, oversized, or path-like names.
+
+## Bridge invocation
+
+When `js_window_api` and the built-in bridge policy allow it, WebView content can dispatch the same command:
+
+```js
+await window.zero.commands.invoke("app.refresh");
+```
+
+The resulting event has `source = .bridge`, the calling native `window_id`, and the calling view label when the call came from a named child WebView.

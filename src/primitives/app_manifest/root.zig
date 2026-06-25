@@ -11,7 +11,12 @@ pub const ValidationError = error{
     DuplicateBridgeCommand,
     DuplicatePlatform,
     DuplicateWindow,
+    DuplicateView,
     DuplicateShortcut,
+    DuplicateFileAssociation,
+    DuplicateUrlScheme,
+    InvalidViewKind,
+    InvalidLayout,
     InvalidUrl,
     InvalidPath,
     InvalidCommand,
@@ -25,6 +30,15 @@ pub const ValidationError = error{
 pub const max_shortcuts: usize = 64;
 pub const max_shortcut_id_bytes: usize = 64;
 pub const max_shortcut_key_bytes: usize = 32;
+pub const max_shell_windows: usize = 16;
+pub const max_shell_views_per_window: usize = 128;
+pub const max_view_label_bytes: usize = 96;
+pub const max_view_role_bytes: usize = 64;
+pub const max_command_id_bytes: usize = 128;
+pub const max_file_associations: usize = 32;
+pub const max_file_association_extensions: usize = 32;
+pub const max_file_association_mime_types: usize = 32;
+pub const max_url_schemes: usize = 32;
 
 pub const Platform = enum {
     macos,
@@ -69,6 +83,7 @@ pub const PermissionKind = enum {
     notifications,
     clipboard,
     window,
+    credentials,
     custom,
 };
 
@@ -81,6 +96,7 @@ pub const Permission = union(PermissionKind) {
     notifications: void,
     clipboard: void,
     window: void,
+    credentials: void,
     custom: []const u8,
 
     pub fn kind(self: Permission) PermissionKind {
@@ -94,7 +110,9 @@ pub const CapabilityKind = enum {
     js_bridge,
     filesystem,
     network,
+    notifications,
     clipboard,
+    credentials,
     custom,
 };
 
@@ -104,7 +122,9 @@ pub const Capability = union(CapabilityKind) {
     js_bridge: void,
     filesystem: void,
     network: void,
+    notifications: void,
     clipboard: void,
+    credentials: void,
     custom: []const u8,
 
     pub fn kind(self: Capability) CapabilityKind {
@@ -205,6 +225,67 @@ pub const Window = struct {
     restore_policy: WindowRestorePolicy = .clamp_to_visible_screen,
 };
 
+pub const ViewKind = enum {
+    webview,
+    toolbar,
+    titlebar_accessory,
+    sidebar,
+    statusbar,
+    split,
+    stack,
+    button,
+    checkbox,
+    toggle,
+    text_field,
+    search_field,
+    label,
+    spacer,
+    gpu_surface,
+};
+
+pub const ShellEdge = enum {
+    top,
+    right,
+    bottom,
+    left,
+};
+
+pub const ShellView = struct {
+    label: []const u8,
+    kind: ViewKind,
+    parent: ?[]const u8 = null,
+    edge: ?ShellEdge = null,
+    x: ?f32 = null,
+    y: ?f32 = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
+    fill: bool = false,
+    layer: i32 = 0,
+    visible: bool = true,
+    enabled: bool = true,
+    role: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+};
+
+pub const ShellWindow = struct {
+    label: []const u8 = "main",
+    title: ?[]const u8 = null,
+    width: f32 = 720,
+    height: f32 = 480,
+    x: ?f32 = null,
+    y: ?f32 = null,
+    resizable: bool = true,
+    restore_state: bool = true,
+    restore_policy: WindowRestorePolicy = .clamp_to_visible_screen,
+    views: []const ShellView = &.{},
+};
+
+pub const ShellConfig = struct {
+    windows: []const ShellWindow = &.{},
+};
+
 pub const ShortcutModifiers = struct {
     primary: bool = false,
     command: bool = false,
@@ -217,6 +298,26 @@ pub const Shortcut = struct {
     id: []const u8,
     key: []const u8,
     modifiers: ShortcutModifiers = .{},
+};
+
+pub const AssociationRole = enum {
+    viewer,
+    editor,
+    shell,
+    none,
+};
+
+pub const FileAssociation = struct {
+    name: []const u8,
+    role: AssociationRole = .viewer,
+    extensions: []const []const u8 = &.{},
+    mime_types: []const []const u8 = &.{},
+    icon: ?[]const u8 = null,
+};
+
+pub const UrlScheme = struct {
+    scheme: []const u8,
+    role: AssociationRole = .viewer,
 };
 
 pub const PackageMetadata = struct {
@@ -245,7 +346,10 @@ pub const Manifest = struct {
     security: SecurityConfig = .{},
     platforms: []const PlatformSettings = &.{},
     windows: []const Window = &.{},
+    shell: ShellConfig = .{},
     shortcuts: []const Shortcut = &.{},
+    file_associations: []const FileAssociation = &.{},
+    url_schemes: []const UrlScheme = &.{},
     cef: CefConfig = .{},
     package: PackageMetadata = .{},
     updates: UpdateConfig = .{},
@@ -262,7 +366,10 @@ pub fn validateManifest(manifest: Manifest) ValidationError!void {
     try validateSecurity(manifest.security);
     try validatePlatforms(manifest.platforms);
     try validateWindows(manifest.windows);
+    try validateShell(manifest.shell, manifest.windows);
     try validateShortcutsForPlatforms(manifest.shortcuts, manifest.platforms);
+    try validateFileAssociations(manifest.file_associations);
+    try validateUrlSchemes(manifest.url_schemes);
     try validateCefConfig(manifest.package.web_engine, manifest.cef);
     try validatePackageMetadata(manifest.package);
     try validateUpdates(manifest.updates);
@@ -292,8 +399,103 @@ pub fn validateWindows(windows: []const Window) ValidationError!void {
     }
 }
 
+pub fn validateShell(shell: ShellConfig, compatibility_windows: []const Window) ValidationError!void {
+    _ = compatibility_windows;
+    if (shell.windows.len > max_shell_windows) return error.InvalidLayout;
+    for (shell.windows, 0..) |window, index| {
+        try validateShellWindow(window);
+        for (shell.windows[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.label, window.label)) return error.DuplicateWindow;
+        }
+    }
+}
+
+fn validateShellWindow(window: ShellWindow) ValidationError!void {
+    if (window.label.len == 0) return error.InvalidName;
+    try validateName(window.label);
+    if (window.title) |title| try validateName(title);
+    if (window.width <= 0 or window.height <= 0) return error.InvalidDimension;
+    if (window.views.len > max_shell_views_per_window) return error.InvalidLayout;
+    try validateShellViews(window.views);
+}
+
+fn validateShellViews(views: []const ShellView) ValidationError!void {
+    for (views, 0..) |view, index| {
+        if (view.label.len == 0 or view.label.len > max_view_label_bytes) return error.InvalidName;
+        try validateName(view.label);
+        for (views[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.label, view.label)) return error.DuplicateView;
+        }
+        if (view.parent) |parent| {
+            try validateName(parent);
+            if (std.mem.eql(u8, parent, view.label) or !shellViewExists(views, parent)) return error.InvalidLayout;
+        }
+        if (view.width) |width| if (width <= 0) return error.InvalidDimension;
+        if (view.height) |height| if (height <= 0) return error.InvalidDimension;
+        if (view.role) |role| {
+            if (role.len > max_view_role_bytes) return error.InvalidName;
+            try validateName(role);
+        }
+        if (view.text) |text| try validateFreeText(text);
+        if (view.command) |command| {
+            if (command.len > max_command_id_bytes) return error.InvalidCommand;
+            try validateName(command);
+        }
+        if (view.url) |url| try validateViewUrl(url);
+        if (view.kind == .webview and view.url == null) return error.MissingRequiredField;
+    }
+}
+
+fn shellViewExists(views: []const ShellView, label: []const u8) bool {
+    for (views) |view| {
+        if (std.mem.eql(u8, view.label, label)) return true;
+    }
+    return false;
+}
+
 pub fn validateShortcuts(shortcuts: []const Shortcut) ValidationError!void {
     return validateShortcutsForPlatforms(shortcuts, &.{});
+}
+
+pub fn validateFileAssociations(file_associations: []const FileAssociation) ValidationError!void {
+    if (file_associations.len > max_file_associations) return error.InvalidPath;
+    for (file_associations, 0..) |association, i| {
+        try validateName(association.name);
+        if (association.extensions.len == 0 and association.mime_types.len == 0) return error.MissingRequiredField;
+        if (association.extensions.len > max_file_association_extensions) return error.InvalidPath;
+        if (association.mime_types.len > max_file_association_mime_types) return error.InvalidPath;
+        if (association.icon) |icon| try validateRelativePath(icon);
+        for (association.extensions, 0..) |extension, extension_index| {
+            try validateFileExtension(extension);
+            for (association.extensions[0..extension_index]) |previous| {
+                if (std.ascii.eqlIgnoreCase(extensionBody(previous), extensionBody(extension))) return error.DuplicateFileAssociation;
+            }
+        }
+        for (association.mime_types, 0..) |mime_type, mime_index| {
+            try validateMimeType(mime_type);
+            for (association.mime_types[0..mime_index]) |previous| {
+                if (std.ascii.eqlIgnoreCase(previous, mime_type)) return error.DuplicateFileAssociation;
+            }
+        }
+        for (file_associations[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, association.name)) return error.DuplicateFileAssociation;
+            for (association.extensions) |extension| {
+                for (previous.extensions) |previous_extension| {
+                    if (std.ascii.eqlIgnoreCase(extensionBody(previous_extension), extensionBody(extension))) return error.DuplicateFileAssociation;
+                }
+            }
+        }
+    }
+}
+
+pub fn validateUrlSchemes(url_schemes: []const UrlScheme) ValidationError!void {
+    if (url_schemes.len > max_url_schemes) return error.InvalidUrl;
+    for (url_schemes, 0..) |scheme, i| {
+        try validateUrlScheme(scheme.scheme);
+        for (url_schemes[0..i]) |previous| {
+            if (std.ascii.eqlIgnoreCase(previous.scheme, scheme.scheme)) return error.DuplicateUrlScheme;
+        }
+    }
 }
 
 pub fn validateShortcutsForPlatforms(shortcuts: []const Shortcut, platforms: []const PlatformSettings) ValidationError!void {
@@ -374,6 +576,36 @@ pub fn validateUrl(url: []const u8) ValidationError!void {
     }
 }
 
+fn validateFileExtension(extension: []const u8) ValidationError!void {
+    if (extension.len == 0) return error.InvalidPath;
+    const body = extensionBody(extension);
+    if (body.len == 0) return error.InvalidPath;
+    for (body) |ch| {
+        if (!isLowerAlpha(ch) and !isUpperAlpha(ch) and !isDigit(ch) and ch != '-' and ch != '_') return error.InvalidPath;
+    }
+}
+
+fn extensionBody(extension: []const u8) []const u8 {
+    return if (extension.len > 0 and extension[0] == '.') extension[1..] else extension;
+}
+
+fn validateMimeType(mime_type: []const u8) ValidationError!void {
+    const slash_index = std.mem.indexOfScalar(u8, mime_type, '/') orelse return error.InvalidPath;
+    if (slash_index == 0 or slash_index + 1 >= mime_type.len) return error.InvalidPath;
+    for (mime_type) |ch| {
+        if (ch == 0 or ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') return error.InvalidPath;
+    }
+}
+
+fn validateUrlScheme(scheme: []const u8) ValidationError!void {
+    if (scheme.len == 0) return error.InvalidUrl;
+    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https") or std.ascii.eqlIgnoreCase(scheme, "file")) return error.InvalidUrl;
+    if (!isLowerAlpha(scheme[0])) return error.InvalidUrl;
+    for (scheme[1..]) |ch| {
+        if (!isLowerAlpha(ch) and !isDigit(ch) and ch != '+' and ch != '-' and ch != '.') return error.InvalidUrl;
+    }
+}
+
 pub fn validateIcons(icons: []const Icon) ValidationError!void {
     for (icons, 0..) |icon, i| {
         if (icon.asset.len == 0) return error.MissingRequiredField;
@@ -448,6 +680,25 @@ pub fn validateBridgeOrigin(origin: []const u8) ValidationError!void {
         return;
     }
     return error.InvalidUrl;
+}
+
+fn validateViewUrl(url: []const u8) ValidationError!void {
+    if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://")) return validateUrl(url);
+    if (std.mem.startsWith(u8, url, "file://") or std.mem.startsWith(u8, url, "zero://")) {
+        const value = url[std.mem.indexOf(u8, url, "://").? + 3 ..];
+        if (value.len == 0) return error.InvalidUrl;
+        for (value) |ch| {
+            if (ch == 0 or ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') return error.InvalidUrl;
+        }
+        return;
+    }
+    return error.InvalidUrl;
+}
+
+fn validateFreeText(text: []const u8) ValidationError!void {
+    for (text) |ch| {
+        if (ch == 0) return error.InvalidName;
+    }
 }
 
 pub fn validateSecurity(security: SecurityConfig) ValidationError!void {
@@ -681,6 +932,54 @@ test "valid minimal manifest" {
     try validateManifest(manifest);
 }
 
+test "manifest validates shell windows and views" {
+    const shell_views = [_]ShellView{
+        .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 44, .role = "toolbar" },
+        .{ .label = "content", .kind = .webview, .url = "zero://app/index.html", .fill = true },
+        .{ .label = "status", .kind = .statusbar, .edge = .bottom, .height = 24, .text = "Ready" },
+        .{ .label = "save", .kind = .button, .parent = "toolbar", .text = "Save", .command = "app.save" },
+    };
+    const shell_windows = [_]ShellWindow{.{
+        .label = "main",
+        .title = "Example",
+        .width = 1100,
+        .height = 760,
+        .views = &shell_views,
+    }};
+    try validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .shell = .{ .windows = &shell_windows },
+    });
+
+    const duplicate_views = [_]ShellView{
+        .{ .label = "content", .kind = .webview, .url = "zero://app/index.html" },
+        .{ .label = "content", .kind = .label, .text = "Duplicate" },
+    };
+    const duplicate_window = [_]ShellWindow{.{ .views = &duplicate_views }};
+    try std.testing.expectError(error.DuplicateView, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .shell = .{ .windows = &duplicate_window },
+    }));
+
+    const missing_url_views = [_]ShellView{.{ .label = "content", .kind = .webview }};
+    const missing_url_window = [_]ShellWindow{.{ .views = &missing_url_views }};
+    try std.testing.expectError(error.MissingRequiredField, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .shell = .{ .windows = &missing_url_window },
+    }));
+
+    const orphan_views = [_]ShellView{.{ .label = "save", .kind = .button, .parent = "missing", .command = "app.save" }};
+    const orphan_window = [_]ShellWindow{.{ .views = &orphan_views }};
+    try std.testing.expectError(error.InvalidLayout, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .shell = .{ .windows = &orphan_window },
+    }));
+}
+
 test "manifest validates keyboard shortcuts" {
     const manifest: Manifest = .{
         .identity = .{ .id = "com.example.app", .name = "example" },
@@ -771,6 +1070,59 @@ test "manifest validates keyboard shortcuts" {
     try std.testing.expectError(error.InvalidShortcut, validateManifest(long_id_manifest));
 }
 
+test "manifest validates file associations and URL schemes" {
+    const doc_extensions = [_][]const u8{ "md", ".markdown" };
+    const doc_mime_types = [_][]const u8{"text/markdown"};
+    const file_associations = [_]FileAssociation{.{
+        .name = "Markdown Document",
+        .extensions = &doc_extensions,
+        .mime_types = &doc_mime_types,
+        .icon = "assets/markdown.icns",
+    }};
+    const url_schemes = [_]UrlScheme{.{ .scheme = "zero-native" }};
+
+    try validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .file_associations = &file_associations,
+        .url_schemes = &url_schemes,
+    });
+
+    const duplicate_associations = [_]FileAssociation{
+        .{ .name = "Markdown", .extensions = &.{"md"} },
+        .{ .name = "Other Markdown", .extensions = &.{"MD"} },
+    };
+    try std.testing.expectError(error.DuplicateFileAssociation, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .file_associations = &duplicate_associations,
+    }));
+
+    const missing_match = [_]FileAssociation{.{ .name = "Empty" }};
+    try std.testing.expectError(error.MissingRequiredField, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .file_associations = &missing_match,
+    }));
+
+    const reserved_schemes = [_]UrlScheme{.{ .scheme = "https" }};
+    try std.testing.expectError(error.InvalidUrl, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .url_schemes = &reserved_schemes,
+    }));
+
+    const duplicate_schemes = [_]UrlScheme{
+        .{ .scheme = "acme" },
+        .{ .scheme = "acme" },
+    };
+    try std.testing.expectError(error.DuplicateUrlScheme, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .url_schemes = &duplicate_schemes,
+    }));
+}
+
 test "frontend validation accepts managed dev server config" {
     const command = [_][]const u8{ "npm", "run", "dev", "--", "--host", "127.0.0.1" };
     try validateFrontend(.{
@@ -800,7 +1152,7 @@ test "valid rich manifest" {
         .{ .asset = "icons/app-128", .size = 128, .scale = 1, .purpose = .any },
         .{ .asset = "icons/app-256", .size = 256, .scale = 1, .purpose = .maskable },
     };
-    const permissions = [_]Permission{ .network, .clipboard, .window, .{ .custom = "com.example.custom" } };
+    const permissions = [_]Permission{ .network, .clipboard, .window, .credentials, .{ .custom = "com.example.custom" } };
     const bridge_permissions = [_]Permission{.clipboard};
     const bridge_origins = [_][]const u8{ "zero://inline", "https://example.com" };
     const bridge_commands = [_]BridgeCommand{.{ .name = "native.ping", .permissions = &bridge_permissions, .origins = &bridge_origins }};
@@ -914,7 +1266,7 @@ test "icon validation catches zero values and duplicates" {
 }
 
 test "permission validation catches duplicates" {
-    try validatePermissions(&.{ .network, .clipboard, .{ .custom = "com.example.custom" } });
+    try validatePermissions(&.{ .network, .clipboard, .credentials, .{ .custom = "com.example.custom" } });
     try std.testing.expectError(error.DuplicatePermission, validatePermissions(&.{ .network, .network }));
     try std.testing.expectError(error.DuplicatePermission, validatePermissions(&.{ .{ .custom = "com.example.custom" }, .{ .custom = "com.example.custom" } }));
     try std.testing.expectError(error.InvalidName, validatePermissions(&.{.{ .custom = "bad/name" }}));
@@ -930,7 +1282,7 @@ test "platform validation catches duplicates and invalid overrides" {
 }
 
 test "capability validation catches duplicates and invalid custom names" {
-    try validateCapabilities(&.{ .native_module, .webview, .{ .custom = "com.example.native-camera" } });
+    try validateCapabilities(&.{ .native_module, .webview, .notifications, .credentials, .{ .custom = "com.example.native-camera" } });
     try std.testing.expectError(error.DuplicateCapability, validateCapabilities(&.{ .webview, .webview }));
     try std.testing.expectError(error.DuplicateCapability, validateCapabilities(&.{ .{ .custom = "custom" }, .{ .custom = "custom" } }));
     try std.testing.expectError(error.InvalidName, validateCapabilities(&.{.{ .custom = "bad/name" }}));

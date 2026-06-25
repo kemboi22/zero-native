@@ -1,0 +1,40 @@
+# Native Controls
+
+Native controls are platform-owned views created through `runtime.createView(...)`, `runtime.createShellViews(...)`, or the guarded `window.zero.views.*` bridge helpers. They are intended for trusted chrome, utility panels, and OS-native affordances around rich WebView content.
+
+```zig
+const shell_views = [_]zero_native.ShellView{
+    .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 52 },
+    .{ .label = "refresh", .kind = .button, .parent = "toolbar", .text = "Refresh", .command = "app.refresh" },
+    .{ .label = "search", .kind = .search_field, .parent = "toolbar", .text = "Search" },
+    .{ .label = "live", .kind = .checkbox, .parent = "toolbar", .text = "Live" },
+    .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
+};
+
+try runtime.createShellViews(1, &shell_views, zero_native.geometry.RectF.init(0, 0, 1100, 760));
+```
+
+## Supported Kinds
+
+| Kind | Notes |
+| --- | --- |
+| `toolbar` | Native container for top app chrome |
+| `titlebar_accessory` | Native titlebar-adjacent container where the platform allows it |
+| `sidebar` | Native side panel container |
+| `statusbar` | Native bottom/status container |
+| `button` | Dispatches `command` through `Event.command` |
+| `checkbox` | Native checkbox control |
+| `toggle` | Native binary toggle button |
+| `text_field` | Native editable text field |
+| `search_field` | Native search input |
+| `label` | Native static text |
+| `spacer` | Empty native layout spacer |
+| `webview` | Compatibility view backed by the WebView backend |
+
+The macOS system-WebView backend supports these native kinds today. Other desktop engines and platforms return explicit unsupported errors until their native hosts implement the same surface.
+
+## Layout
+
+For declarative shell views, use `edge` for docked chrome, `fill = true` for content, and `parent` for controls inside containers. The runtime keeps shell views bound to the window and reapplies their frames on resize.
+
+Use `role` for accessibility text. Use `text` for visible labels, button titles, and text/search placeholders when no separate role is needed.
