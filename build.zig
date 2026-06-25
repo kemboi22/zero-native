@@ -243,6 +243,9 @@ pub fn build(b: *std.Build) void {
     addExampleTestStep(b, native_examples_step, "test-example-native-shell", "Run native shell example tests", "examples/native-shell");
     addExampleTestStep(b, native_examples_step, "test-example-native-panels", "Run native panels example tests", "examples/native-panels");
     addExampleTestStep(b, native_examples_step, "test-example-capabilities", "Run capabilities example tests", "examples/capabilities");
+    addFileContainsCheckStep(b, native_examples_step, "test-example-capabilities-events", "Verify capabilities example event bridge names", &.{
+        .{ .path = "examples/capabilities/src/main.zig", .pattern = "zero-native:drop:files" },
+    });
 
     const mobile_examples_step = b.step("test-examples-mobile", "Verify mobile example project layouts");
     addLayoutCheckStep(b, mobile_examples_step, "test-example-ios-layout", "Verify iOS example layout", &.{
