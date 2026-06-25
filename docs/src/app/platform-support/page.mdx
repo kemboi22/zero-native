@@ -54,6 +54,17 @@ The macOS, Linux, and Windows system-WebView hosts support `toolbar`, `titlebar_
 
 iOS and Android are supported today through embedded host examples rather than the desktop platform host matrix. The mobile examples own native header/navigation layout in UIKit or Android views, embed a `WKWebView` or Android `WebView` as the workspace, and drive zero-native through the C/JNI lifecycle, activation, resize, and command calls documented in [Embedded App](/embed).
 
+| Area | iOS embedded host | Android embedded host |
+| --- | --- | --- |
+| Native header/navigation | UIKit header with Back and Refresh command buttons | Android view header with Back and Refresh command buttons |
+| WebView content area | `WKWebView` workspace | Android `WebView` workspace |
+| Runtime lifecycle | `zero_native_app_create`, `start`, `activate`, `deactivate`, `stop`, and `destroy` from Swift | JNI bridge for `create`, `start`, `activate`, `deactivate`, `stop`, and `destroy` |
+| Resize and orientation | `viewDidLayoutSubviews` forwards WebView size and screen scale | `surfaceChanged` forwards size, density, and `Surface` |
+| Keyboard avoidance | Keyboard frame notifications adjust the WebView bottom constraint | `windowSoftInputMode="adjustResize"` lets Android relayout the content area |
+| Back/navigation command | Native Back button dispatches `mobile.back` | Native Back button and system Back dispatch `mobile.back` |
+| Touch forwarding | UIKit/WebKit own touch handling for the WebView workspace | `MotionEvent` pointer data is forwarded through `zero_native_app_touch` |
+| Generic `ShellView` mapping | Not materialized on UIKit yet | Not materialized on Android `ViewGroup` yet |
+
 The desktop `ShellView` tree is not yet mapped to UIKit or Android `ViewGroup`, so generic native view commands should be treated as desktop APIs for now. Mobile hosts own safe areas, orientation, keyboard avoidance, back gestures, and platform lifecycle integration.
 
 `gpu_surface` is reserved for future custom drawing regions. Current hosts report unsupported operations for that view kind and `runtime.supports(.gpu_surfaces)` / `window.zero.platform.supports("gpuSurfaces")` return `false`.
