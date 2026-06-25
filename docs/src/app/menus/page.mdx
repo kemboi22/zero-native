@@ -1,6 +1,20 @@
 # Menus
 
-zero-native can configure native app menus from typed Zig data. Menu items dispatch through the same command path as shortcuts, native controls, tray actions, and bridge commands.
+zero-native can configure native app menus from `app.zon` or typed Zig data. Menu items dispatch through the same command path as shortcuts, native controls, tray actions, and bridge commands.
+
+```zig
+.menus = .{
+    .{
+        .title = "View",
+        .items = .{
+            .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
+            .{ .separator = true },
+        },
+    },
+},
+```
+
+Generated runners load `app.zon` menus automatically. Pass `menus` to `runWithOptions` when an app needs to override the manifest at runtime:
 
 ```zig
 const view_items = [_]zero_native.MenuItem{

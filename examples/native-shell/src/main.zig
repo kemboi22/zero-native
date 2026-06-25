@@ -133,15 +133,6 @@ const builtin_policies = [_]zero_native.BridgeCommandPolicy{
     .{ .name = "zero-native.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
     .{ .name = "zero-native.view.list", .permissions = &view_permission, .origins = &bridge_origins },
 };
-const shortcuts = [_]zero_native.Shortcut{
-    .{ .id = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
-};
-const view_menu_items = [_]zero_native.MenuItem{
-    .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
-};
-const menus = [_]zero_native.Menu{
-    .{ .title = "View", .items = &view_menu_items },
-};
 const shell_views = [_]zero_native.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = toolbar_height, .layer = 20, .role = "Toolbar" },
     .{ .label = "refresh-button", .kind = .button, .parent = "toolbar", .x = 12, .y = 10, .width = 88, .height = 30, .layer = 21, .text = "Refresh", .command = "app.refresh" },
@@ -224,8 +215,6 @@ pub fn main(init: std.process.Init) !void {
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &bridge_origins },
         },
-        .menus = &menus,
-        .shortcuts = &shortcuts,
     }, init);
 }
 

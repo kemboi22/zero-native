@@ -25,6 +25,7 @@ pub const Metadata = struct {
     security: SecurityMetadata = .{},
     windows: []const WindowMetadata = &.{},
     shell: ShellMetadata = .{},
+    menus: []const MenuMetadata = &.{},
     shortcuts: []const ShortcutMetadata = &.{},
     file_associations: []const FileAssociationMetadata = &.{},
     url_schemes: []const UrlSchemeMetadata = &.{},
@@ -96,6 +97,18 @@ pub const Metadata = struct {
             if (window.views.len > 0) allocator.free(window.views);
         }
         if (self.shell.windows.len > 0) allocator.free(self.shell.windows);
+        for (self.menus) |menu| {
+            allocator.free(menu.title);
+            for (menu.items) |item| {
+                allocator.free(item.label);
+                allocator.free(item.command);
+                allocator.free(item.key);
+                for (item.modifiers) |value| allocator.free(value);
+                if (item.modifiers.len > 0) allocator.free(item.modifiers);
+            }
+            if (menu.items.len > 0) allocator.free(menu.items);
+        }
+        if (self.menus.len > 0) allocator.free(self.menus);
         for (self.shortcuts) |shortcut| {
             allocator.free(shortcut.id);
             allocator.free(shortcut.key);
@@ -184,6 +197,21 @@ pub const ShortcutMetadata = struct {
     modifiers: []const []const u8 = &.{},
 };
 
+pub const MenuMetadata = struct {
+    title: []const u8,
+    items: []const MenuItemMetadata = &.{},
+};
+
+pub const MenuItemMetadata = struct {
+    label: []const u8 = "",
+    command: []const u8 = "",
+    key: []const u8 = "",
+    modifiers: []const []const u8 = &.{},
+    separator: bool = false,
+    enabled: bool = true,
+    checked: bool = false,
+};
+
 pub const FileAssociationMetadata = struct {
     name: []const u8,
     role: []const u8 = "viewer",
@@ -237,6 +265,8 @@ const RawWindow = raw_manifest.RawWindow;
 const RawShell = raw_manifest.RawShell;
 const RawShellWindow = raw_manifest.RawShellWindow;
 const RawShellView = raw_manifest.RawShellView;
+const RawMenu = raw_manifest.RawMenu;
+const RawMenuItem = raw_manifest.RawMenuItem;
 const RawShortcut = raw_manifest.RawShortcut;
 const RawFileAssociation = raw_manifest.RawFileAssociation;
 const RawUrlScheme = raw_manifest.RawUrlScheme;
@@ -264,6 +294,8 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     defer allocator.free(windows);
     const shell = parseShell(allocator, metadata.shell) catch return .{ .ok = false, .message = "app.zon shell is invalid" };
     defer deinitParsedShell(allocator, shell);
+    const menus = parseMenus(allocator, metadata.menus) catch return .{ .ok = false, .message = "app.zon menus are invalid" };
+    defer deinitParsedMenus(allocator, menus);
     const shortcuts = parseShortcuts(allocator, metadata.shortcuts) catch return .{ .ok = false, .message = "app.zon shortcuts are invalid" };
     defer allocator.free(shortcuts);
     const file_associations = parseFileAssociations(allocator, metadata.file_associations) catch return .{ .ok = false, .message = "app.zon file associations are invalid" };
@@ -283,6 +315,7 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         .platforms = parsePlatformSettings(allocator, metadata.platforms) catch return .{ .ok = false, .message = "app.zon platforms are invalid" },
         .windows = windows,
         .shell = shell,
+        .menus = menus,
         .shortcuts = shortcuts,
         .file_associations = file_associations,
         .url_schemes = url_schemes,
@@ -325,6 +358,7 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Metadata {
         .security = try convertRawSecurity(allocator, raw.security),
         .windows = try convertRawWindows(allocator, raw.windows),
         .shell = try convertRawShell(allocator, raw.shell),
+        .menus = try convertRawMenus(allocator, raw.menus),
         .shortcuts = try convertRawShortcuts(allocator, raw.shortcuts),
         .file_associations = try convertRawFileAssociations(allocator, raw.file_associations),
         .url_schemes = try convertRawUrlSchemes(allocator, raw.url_schemes),
@@ -469,6 +503,35 @@ fn convertRawShortcuts(allocator: std.mem.Allocator, shortcuts: []const RawShort
             .id = try allocator.dupe(u8, shortcut.id),
             .key = try allocator.dupe(u8, shortcut.key),
             .modifiers = try duplicateStringList(allocator, shortcut.modifiers),
+        };
+    }
+    return converted;
+}
+
+fn convertRawMenus(allocator: std.mem.Allocator, menus: []const RawMenu) ![]const MenuMetadata {
+    if (menus.len == 0) return &.{};
+    const converted = try allocator.alloc(MenuMetadata, menus.len);
+    for (menus, 0..) |menu, index| {
+        converted[index] = .{
+            .title = try allocator.dupe(u8, menu.title),
+            .items = try convertRawMenuItems(allocator, menu.items),
+        };
+    }
+    return converted;
+}
+
+fn convertRawMenuItems(allocator: std.mem.Allocator, items: []const RawMenuItem) ![]const MenuItemMetadata {
+    if (items.len == 0) return &.{};
+    const converted = try allocator.alloc(MenuItemMetadata, items.len);
+    for (items, 0..) |item, index| {
+        converted[index] = .{
+            .label = try allocator.dupe(u8, item.label),
+            .command = try allocator.dupe(u8, item.command),
+            .key = try allocator.dupe(u8, item.key),
+            .modifiers = try duplicateStringList(allocator, item.modifiers),
+            .separator = item.separator,
+            .enabled = item.enabled,
+            .checked = item.checked,
         };
     }
     return converted;
@@ -641,6 +704,13 @@ fn deinitParsedShell(allocator: std.mem.Allocator, shell: app_manifest.ShellConf
     if (shell.windows.len > 0) allocator.free(shell.windows);
 }
 
+fn deinitParsedMenus(allocator: std.mem.Allocator, menus: []const app_manifest.Menu) void {
+    for (menus) |menu| {
+        if (menu.items.len > 0) allocator.free(menu.items);
+    }
+    if (menus.len > 0) allocator.free(menus);
+}
+
 fn validateIconPaths(icons: []const []const u8) !void {
     for (icons, 0..) |icon, index| {
         try validateRelativePath(icon);
@@ -733,6 +803,42 @@ fn parseShortcuts(allocator: std.mem.Allocator, values: []const ShortcutMetadata
         });
     }
     return shortcuts.toOwnedSlice(allocator);
+}
+
+fn parseMenus(allocator: std.mem.Allocator, values: []const MenuMetadata) ![]const app_manifest.Menu {
+    if (values.len == 0) return &.{};
+    var menus: std.ArrayList(app_manifest.Menu) = .empty;
+    errdefer {
+        for (menus.items) |menu| {
+            if (menu.items.len > 0) allocator.free(menu.items);
+        }
+        menus.deinit(allocator);
+    }
+    for (values) |value| {
+        try menus.append(allocator, .{
+            .title = value.title,
+            .items = try parseMenuItems(allocator, value.items),
+        });
+    }
+    return menus.toOwnedSlice(allocator);
+}
+
+fn parseMenuItems(allocator: std.mem.Allocator, values: []const MenuItemMetadata) ![]const app_manifest.MenuItem {
+    if (values.len == 0) return &.{};
+    var items: std.ArrayList(app_manifest.MenuItem) = .empty;
+    errdefer items.deinit(allocator);
+    for (values) |value| {
+        try items.append(allocator, .{
+            .label = value.label,
+            .command = value.command,
+            .key = value.key,
+            .modifiers = try parseShortcutModifiers(value.modifiers),
+            .separator = value.separator,
+            .enabled = value.enabled,
+            .checked = value.checked,
+        });
+    }
+    return items.toOwnedSlice(allocator);
 }
 
 fn parseFileAssociations(allocator: std.mem.Allocator, values: []const FileAssociationMetadata) ![]const app_manifest.FileAssociation {
@@ -908,6 +1014,16 @@ test "manifest metadata parser reads identity version and lists" {
         \\  .bridge = .{ .commands = .{ .{ .name = "native.ping" } } },
         \\  .web_engine = "chromium",
         \\  .cef = .{ .dir = "third_party/cef/macos", .auto_install = true },
+        \\  .menus = .{
+        \\    .{
+        \\      .title = "View",
+        \\      .items = .{
+        \\        .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
+        \\        .{ .separator = true },
+        \\        .{ .label = "Sidebar", .command = "app.sidebar.toggle", .checked = true },
+        \\      },
+        \\    },
+        \\  },
         \\  .shortcuts = .{
         \\    .{ .id = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
         \\  },
@@ -946,6 +1062,12 @@ test "manifest metadata parser reads identity version and lists" {
     try std.testing.expectEqual(app_manifest.CapabilityKind.recent_documents, parsed_capabilities[14].kind());
     try std.testing.expectEqual(app_manifest.CapabilityKind.app_activation_events, parsed_capabilities[15].kind());
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
+    try std.testing.expectEqualStrings("View", metadata.menus[0].title);
+    try std.testing.expectEqualStrings("Refresh", metadata.menus[0].items[0].label);
+    try std.testing.expectEqualStrings("app.refresh", metadata.menus[0].items[0].command);
+    try std.testing.expectEqualStrings("primary", metadata.menus[0].items[0].modifiers[0]);
+    try std.testing.expect(metadata.menus[0].items[1].separator);
+    try std.testing.expect(metadata.menus[0].items[2].checked);
     try std.testing.expectEqualStrings("command.palette", metadata.shortcuts[0].id);
     try std.testing.expectEqualStrings("primary", metadata.shortcuts[0].modifiers[0]);
     try std.testing.expectEqualStrings("Markdown Document", metadata.file_associations[0].name);
@@ -962,9 +1084,12 @@ test "manifest metadata parser reads identity version and lists" {
     defer std.testing.allocator.free(associations);
     const schemes = try parseUrlSchemes(std.testing.allocator, metadata.url_schemes);
     defer std.testing.allocator.free(schemes);
+    const menus = try parseMenus(std.testing.allocator, metadata.menus);
+    defer deinitParsedMenus(std.testing.allocator, menus);
     try app_manifest.validateManifest(.{
         .identity = .{ .id = metadata.id, .name = metadata.name },
         .version = try parseVersion(metadata.version),
+        .menus = menus,
         .file_associations = associations,
         .url_schemes = schemes,
     });

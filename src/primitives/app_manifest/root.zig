@@ -35,6 +35,11 @@ pub const max_shell_views_per_window: usize = 128;
 pub const max_view_label_bytes: usize = 96;
 pub const max_view_role_bytes: usize = 64;
 pub const max_command_id_bytes: usize = 128;
+pub const max_menus: usize = 16;
+pub const max_menu_items: usize = 128;
+pub const max_menu_title_bytes: usize = 64;
+pub const max_menu_item_label_bytes: usize = 128;
+pub const max_menu_key_bytes: usize = 32;
 pub const max_file_associations: usize = 32;
 pub const max_file_association_extensions: usize = 32;
 pub const max_file_association_mime_types: usize = 32;
@@ -343,6 +348,21 @@ pub const Shortcut = struct {
     modifiers: ShortcutModifiers = .{},
 };
 
+pub const Menu = struct {
+    title: []const u8,
+    items: []const MenuItem = &.{},
+};
+
+pub const MenuItem = struct {
+    label: []const u8 = "",
+    command: []const u8 = "",
+    key: []const u8 = "",
+    modifiers: ShortcutModifiers = .{},
+    separator: bool = false,
+    enabled: bool = true,
+    checked: bool = false,
+};
+
 pub const AssociationRole = enum {
     viewer,
     editor,
@@ -390,6 +410,7 @@ pub const Manifest = struct {
     platforms: []const PlatformSettings = &.{},
     windows: []const Window = &.{},
     shell: ShellConfig = .{},
+    menus: []const Menu = &.{},
     shortcuts: []const Shortcut = &.{},
     file_associations: []const FileAssociation = &.{},
     url_schemes: []const UrlScheme = &.{},
@@ -410,6 +431,7 @@ pub fn validateManifest(manifest: Manifest) ValidationError!void {
     try validatePlatforms(manifest.platforms);
     try validateWindows(manifest.windows);
     try validateShell(manifest.shell, manifest.windows);
+    try validateMenus(manifest.menus);
     try validateShortcutsForPlatforms(manifest.shortcuts, manifest.platforms);
     try validateFileAssociations(manifest.file_associations);
     try validateUrlSchemes(manifest.url_schemes);
@@ -508,6 +530,31 @@ fn shellViewExists(views: []const ShellView, label: []const u8) bool {
 
 pub fn validateShortcuts(shortcuts: []const Shortcut) ValidationError!void {
     return validateShortcutsForPlatforms(shortcuts, &.{});
+}
+
+pub fn validateMenus(menus: []const Menu) ValidationError!void {
+    if (menus.len > max_menus) return error.InvalidLayout;
+    var item_count: usize = 0;
+    for (menus) |menu| {
+        if (menu.title.len > max_menu_title_bytes) return error.InvalidName;
+        try validateName(menu.title);
+        item_count += menu.items.len;
+        if (item_count > max_menu_items) return error.InvalidLayout;
+        for (menu.items) |item| try validateMenuItem(item);
+    }
+}
+
+fn validateMenuItem(item: MenuItem) ValidationError!void {
+    if (item.separator) return;
+    if (item.label.len > max_menu_item_label_bytes) return error.InvalidName;
+    try validateName(item.label);
+    if (item.command.len == 0 or item.command.len > max_command_id_bytes) return error.InvalidCommand;
+    try validateName(item.command);
+    if (item.key.len > 0) {
+        if (item.key.len > max_menu_key_bytes) return error.InvalidShortcut;
+        try validateShortcutKey(item.key);
+        if (!shortcutModifiersHasAny(item.modifiers) and shortcutRequiresModifier(item.key)) return error.InvalidShortcut;
+    }
 }
 
 pub fn validateFileAssociations(file_associations: []const FileAssociation) ValidationError!void {
@@ -1129,6 +1176,44 @@ test "manifest validates keyboard shortcuts" {
         .shortcuts = &.{.{ .id = long_id[0..], .key = "p" }},
     };
     try std.testing.expectError(error.InvalidShortcut, validateManifest(long_id_manifest));
+}
+
+test "manifest validates native menus" {
+    const view_items = [_]MenuItem{
+        .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ .primary = true } },
+        .{ .separator = true },
+        .{ .label = "Sidebar", .command = "app.sidebar.toggle", .checked = true },
+    };
+    const menus = [_]Menu{.{ .title = "View", .items = &view_items }};
+
+    try validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .menus = &menus,
+    });
+
+    const missing_command_items = [_]MenuItem{.{ .label = "Refresh" }};
+    const missing_command_menus = [_]Menu{.{ .title = "View", .items = &missing_command_items }};
+    try std.testing.expectError(error.InvalidCommand, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .menus = &missing_command_menus,
+    }));
+
+    const invalid_key_items = [_]MenuItem{.{ .label = "Refresh", .command = "app.refresh", .key = "r" }};
+    const invalid_key_menus = [_]Menu{.{ .title = "View", .items = &invalid_key_items }};
+    try std.testing.expectError(error.InvalidShortcut, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .menus = &invalid_key_menus,
+    }));
+
+    const too_many = [_]Menu{.{ .title = "View" }} ** (max_menus + 1);
+    try std.testing.expectError(error.InvalidLayout, validateManifest(.{
+        .identity = .{ .id = "com.example.app", .name = "example" },
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .menus = &too_many,
+    }));
 }
 
 test "manifest validates file associations and URL schemes" {

@@ -13,7 +13,7 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     .icons = .{ "assets/icon.icns", "assets/icon.ico" },
     .platforms = .{ "macos" },
     .permissions = .{ "command", "view", "dialog", "window", "clipboard", "credentials" },
-    .capabilities = .{ "webview", "js_bridge", "native_views", "shortcuts", "dialog", "clipboard", "credentials" },
+    .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts", "dialog", "clipboard", "credentials" },
     .bridge = .{
         .commands = .{
             .{ .name = "native.ping", .origins = .{ "zero://app" } },
@@ -38,6 +38,16 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     },
     .shortcuts = .{
         .{ .id = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
+    },
+    .menus = .{
+        .{
+            .title = "View",
+            .items = .{
+                .{ .label = "Command Palette", .command = "command.palette", .key = "p", .modifiers = .{ "primary", "shift" } },
+                .{ .separator = true },
+                .{ .label = "Reload", .command = "app.reload", .key = "r", .modifiers = .{ "primary" } },
+            },
+        },
     },
     .file_associations = .{
         .{
@@ -124,6 +134,10 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
       <td>Keyboard shortcuts delivered as <code>shortcut</code> events (see <a href="/keyboard-shortcuts">Keyboard Shortcuts</a>)</td>
     </tr>
     <tr>
+      <td><code>menus</code></td>
+      <td>Native menu declarations delivered through the command event path (see <a href="/menus">Menus</a>)</td>
+    </tr>
+    <tr>
       <td><code>file_associations</code></td>
       <td>File type registration metadata for packaging</td>
     </tr>
@@ -190,6 +204,27 @@ Single-character keys and text-entry keys (`enter`, `tab`, `space`, and `backspa
 An app can define up to 64 shortcuts. Shortcut ids can be up to 64 bytes and keys can be up to 32 bytes.
 
 Linux Chromium builds currently reject non-empty `shortcuts`; use the Linux system WebView backend when an app needs native shortcut events.
+
+## `menus`
+
+The optional `menus` list defines native app menus. Generated runners load these automatically:
+
+```zig
+.menus = .{
+    .{
+        .title = "View",
+        .items = .{
+            .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
+            .{ .separator = true },
+            .{ .label = "Sidebar", .command = "app.sidebar.toggle", .checked = true },
+        },
+    },
+},
+```
+
+Each menu has a `title` and optional `items`. Command-backed items require `label` and `command`. Optional fields are `key`, `modifiers`, `separator`, `enabled`, and `checked`. `modifiers` accepts the same values as shortcuts.
+
+An app can define up to 16 menus and 128 total menu items. Menu titles can be up to 64 bytes, item labels up to 128 bytes, command ids up to 128 bytes, and keys up to 32 bytes.
 
 ## File associations and URL schemes
 

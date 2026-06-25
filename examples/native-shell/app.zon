@@ -10,6 +10,14 @@
     .shortcuts = .{
         .{ .id = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
     },
+    .menus = .{
+        .{
+            .title = "View",
+            .items = .{
+                .{ .label = "Refresh", .command = "app.refresh", .key = "r", .modifiers = .{ "primary" } },
+            },
+        },
+    },
     .shell = .{
         .windows = .{
             .{

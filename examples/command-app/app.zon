@@ -10,6 +10,14 @@
     .shortcuts = .{
         .{ .id = "app.sync", .key = "s", .modifiers = .{ "primary" } },
     },
+    .menus = .{
+        .{
+            .title = "View",
+            .items = .{
+                .{ .label = "Sync", .command = "app.sync", .key = "s", .modifiers = .{ "primary" } },
+            },
+        },
+    },
     .shell = .{
         .windows = .{
             .{
@@ -23,7 +31,7 @@
                     .{ .label = "sync-button", .kind = "button", .parent = "toolbar", .x = 12, .y = 9, .width = 92, .height = 30, .text = "Sync", .command = "app.sync" },
                     .{ .label = "main", .kind = "webview", .url = "zero://inline", .fill = true },
                     .{ .label = "statusbar", .kind = "statusbar", .edge = "bottom", .height = 34, .role = "Status" },
-                    .{ .label = "status-label", .kind = "label", .parent = "statusbar", .x = 14, .y = 8, .width = 520, .height = 18, .text = "Ready. Use the toolbar, menu, shortcut, or WebView button." },
+                    .{ .label = "status-label", .kind = "label", .parent = "statusbar", .x = 14, .y = 8, .width = 520, .height = 18, .text = "Ready. Use the toolbar, menu, tray, shortcut, or WebView button." },
                 },
             },
         },

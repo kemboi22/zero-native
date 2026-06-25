@@ -111,15 +111,6 @@ const command_permission = [_][]const u8{zero_native.security.permission_command
 const builtin_policies = [_]zero_native.BridgeCommandPolicy{
     .{ .name = "zero-native.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
 };
-const shortcuts = [_]zero_native.Shortcut{
-    .{ .id = command_id, .key = "s", .modifiers = .{ .primary = true } },
-};
-const command_menu_items = [_]zero_native.MenuItem{
-    .{ .label = "Sync", .command = command_id, .key = "s", .modifiers = .{ .primary = true } },
-};
-const menus = [_]zero_native.Menu{
-    .{ .title = "View", .items = &command_menu_items },
-};
 const tray_items = [_]zero_native.TrayMenuItem{
     .{ .id = 1, .label = "Sync", .command = command_id },
 };
@@ -213,8 +204,6 @@ pub fn main(init: std.process.Init) !void {
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &bridge_origins },
         },
-        .menus = &menus,
-        .shortcuts = &shortcuts,
     }, init);
 }
 
