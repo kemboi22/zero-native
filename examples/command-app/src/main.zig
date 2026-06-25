@@ -79,8 +79,8 @@ const html =
     \\</head>
     \\<body>
     \\  <main>
-    \\    <h1>One command, four entry points</h1>
-    \\    <p>The toolbar button, View menu, primary shortcut, and WebView button all dispatch app.sync into the same Zig command handler.</p>
+    \\    <h1>One command, five entry points</h1>
+    \\    <p>The toolbar button, View menu, tray item, primary shortcut, and WebView button all dispatch app.sync into the same Zig command handler.</p>
     \\    <div class="panel">
     \\      <p>Dispatch from the WebView through the built-in command bridge.</p>
     \\      <button id="sync" type="button">Sync</button>
@@ -120,12 +120,15 @@ const command_menu_items = [_]zero_native.MenuItem{
 const menus = [_]zero_native.Menu{
     .{ .title = "View", .items = &command_menu_items },
 };
+const tray_items = [_]zero_native.TrayMenuItem{
+    .{ .id = 1, .label = "Sync", .command = command_id },
+};
 const shell_views = [_]zero_native.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = toolbar_height, .layer = 20, .role = "Toolbar" },
     .{ .label = "sync-button", .kind = .button, .parent = "toolbar", .x = 12, .y = 9, .width = 92, .height = 30, .layer = 21, .text = "Sync", .command = command_id },
     .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
-    .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 14, .y = 8, .width = 520, .height = 18, .layer = 21, .text = "Ready. Use the toolbar, menu, shortcut, or WebView button." },
+    .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 14, .y = 8, .width = 620, .height = 18, .layer = 21, .text = "Ready. Use the toolbar, menu, tray, shortcut, or WebView button." },
 };
 const shell_windows = [_]zero_native.ShellWindow{.{
     .label = "main",
@@ -147,6 +150,7 @@ const CommandApp = struct {
             .name = "command-app",
             .source = zero_native.WebViewSource.html(html),
             .scene_fn = scene,
+            .start_fn = start,
             .event_fn = event,
         };
     }
@@ -154,6 +158,15 @@ const CommandApp = struct {
     fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
         _ = context;
         return shell_scene;
+    }
+
+    fn start(context: *anyopaque, runtime: *zero_native.Runtime) anyerror!void {
+        _ = context;
+        try runtime.createTray(.{
+            .icon_path = "assets/icon.icns",
+            .tooltip = "zero-native Command App",
+            .items = &tray_items,
+        });
     }
 
     fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {
@@ -181,7 +194,8 @@ const CommandApp = struct {
             "Handled {s} from {s}. Count {d}.",
             .{ command.name, @tagName(command.source), self.command_count },
         );
-        _ = try runtime.updateView(command.window_id, "status-label", .{ .text = status });
+        const status_window_id = if (command.window_id == 0) 1 else command.window_id;
+        _ = try runtime.updateView(status_window_id, "status-label", .{ .text = status });
     }
 };
 
@@ -204,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
     }, init);
 }
 
-test "command app routes toolbar menu shortcut and bridge commands" {
+test "command app routes toolbar menu tray shortcut and bridge commands" {
     var harness: zero_native.TestHarness() = undefined;
     harness.init(.{ .size = zero_native.geometry.SizeF.init(window_width, window_height) });
     harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &builtin_policies };
@@ -226,6 +240,8 @@ test "command app routes toolbar menu shortcut and bridge commands" {
         .name = command_id,
         .window_id = 1,
     } });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.trayCreateCount());
+    try harness.runtime.dispatchPlatformEvent(app.app(), .{ .tray_action = 1 });
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .shortcut = .{
         .id = command_id,
         .key = "s",
@@ -239,11 +255,12 @@ test "command app routes toolbar menu shortcut and bridge commands" {
         .webview_label = "main",
     } });
 
-    try std.testing.expectEqual(@as(u32, 4), app.command_count);
+    try std.testing.expectEqual(@as(u32, 5), app.command_count);
     try std.testing.expectEqualStrings(command_id, app.last_command_name);
     try std.testing.expectEqual(zero_native.CommandSource.toolbar, app.sources[0]);
     try std.testing.expectEqual(zero_native.CommandSource.menu, app.sources[1]);
-    try std.testing.expectEqual(zero_native.CommandSource.shortcut, app.sources[2]);
-    try std.testing.expectEqual(zero_native.CommandSource.bridge, app.sources[3]);
+    try std.testing.expectEqual(zero_native.CommandSource.tray, app.sources[2]);
+    try std.testing.expectEqual(zero_native.CommandSource.shortcut, app.sources[3]);
+    try std.testing.expectEqual(zero_native.CommandSource.bridge, app.sources[4]);
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
 }

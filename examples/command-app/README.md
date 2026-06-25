@@ -4,6 +4,7 @@ This example shows one `app.sync` command handled from each user-facing entry po
 
 - Native toolbar button.
 - Native menu item.
+- Native tray item.
 - App shortcut.
 - WebView bridge call.
 
