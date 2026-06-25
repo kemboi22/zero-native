@@ -174,6 +174,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(desktop_tests).step);
     test_step.dependOn(&b.addRunArtifact(automation_protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(tooling_tests).step);
+    addFileContainsCheckStep(b, test_step, "test-package-types", "Verify package TypeScript platform feature names", &.{
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"native_control_commands\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"nativeControlCommands\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"recent_documents\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"recentDocuments\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"file_drops\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"fileDrops\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"app_activation_events\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"appActivationEvents\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpu_surfaces\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpuSurfaces\"" },
+    });
 
     addTestStep(b, "test-geometry", "Run geometry module tests", geometry_tests);
     addTestStep(b, "test-assets", "Run assets module tests", assets_tests);
