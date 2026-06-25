@@ -485,6 +485,21 @@ pub const Runtime = struct {
         try self.options.platform.services.clearRecentDocuments();
     }
 
+    pub fn showOpenDialog(self: *Runtime, options: platform.OpenDialogOptions, buffer: []u8) anyerror!platform.OpenDialogResult {
+        try validateOpenDialogOptions(options, buffer);
+        return self.options.platform.services.showOpenDialog(options, buffer);
+    }
+
+    pub fn showSaveDialog(self: *Runtime, options: platform.SaveDialogOptions, buffer: []u8) anyerror!?[]const u8 {
+        try validateSaveDialogOptions(options, buffer);
+        return self.options.platform.services.showSaveDialog(options, buffer);
+    }
+
+    pub fn showMessageDialog(self: *Runtime, options: platform.MessageDialogOptions) anyerror!platform.MessageDialogResult {
+        try validateMessageDialogOptions(options);
+        return self.options.platform.services.showMessageDialog(options);
+    }
+
     pub fn showNotification(self: *Runtime, options: platform.NotificationOptions) anyerror!void {
         try validateNotificationOptions(options);
         try self.options.platform.services.showNotification(options);
@@ -1496,7 +1511,7 @@ pub const Runtime = struct {
         const allow_dirs = jsonBoolField(payload, "allowDirectories") orelse false;
         const allow_multi = jsonBoolField(payload, "allowMultiple") orelse false;
         var dialog_buffer: [platform.max_dialog_paths_bytes]u8 = undefined;
-        const result = try self.options.platform.services.showOpenDialog(.{
+        const result = try self.showOpenDialog(.{
             .title = title,
             .default_path = default_path,
             .allow_directories = allow_dirs,
@@ -1533,7 +1548,7 @@ pub const Runtime = struct {
         const default_path = jsonStringField(payload, "defaultPath", &storage) orelse "";
         const default_name = jsonStringField(payload, "defaultName", &storage) orelse "";
         var dialog_buffer: [platform.max_dialog_path_bytes]u8 = undefined;
-        const path = try self.options.platform.services.showSaveDialog(.{
+        const path = try self.showSaveDialog(.{
             .title = title,
             .default_path = default_path,
             .default_name = default_name,
@@ -1564,7 +1579,7 @@ pub const Runtime = struct {
         else
             .info;
 
-        const result = try self.options.platform.services.showMessageDialog(.{
+        const result = try self.showMessageDialog(.{
             .style = style,
             .title = title,
             .message = message,
@@ -2841,6 +2856,8 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
         error.RevealPathTooLarge => "Reveal path is too large",
         error.InvalidRecentDocumentPath => "Recent document path is invalid",
         error.RecentDocumentPathTooLarge => "Recent document path is too large",
+        error.InvalidDialogOptions => "Dialog options are invalid",
+        error.DialogFieldTooLarge => "Dialog field is too large",
         error.InvalidNotificationOptions => "Notification options are invalid",
         error.NotificationFieldTooLarge => "Notification field is too large",
         error.InvalidClipboardOptions => "Clipboard options are invalid",
@@ -2907,6 +2924,8 @@ fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
         error.RevealPathTooLarge,
         error.InvalidRecentDocumentPath,
         error.RecentDocumentPathTooLarge,
+        error.InvalidDialogOptions,
+        error.DialogFieldTooLarge,
         error.InvalidNotificationOptions,
         error.NotificationFieldTooLarge,
         error.InvalidClipboardOptions,
@@ -2947,6 +2966,53 @@ fn validateRecentDocumentPath(path: []const u8) !void {
     if (path.len > platform.max_recent_document_path_bytes) return error.RecentDocumentPathTooLarge;
     for (path) |ch| {
         if (ch == 0) return error.InvalidRecentDocumentPath;
+    }
+}
+
+fn validateOpenDialogOptions(options: platform.OpenDialogOptions, buffer: []u8) !void {
+    if (buffer.len == 0) return error.InvalidDialogOptions;
+    try validateDialogString(options.title, platform.max_dialog_title_bytes, true);
+    try validateDialogString(options.default_path, platform.max_dialog_path_bytes, true);
+    try validateDialogFilters(options.filters);
+}
+
+fn validateSaveDialogOptions(options: platform.SaveDialogOptions, buffer: []u8) !void {
+    if (buffer.len == 0) return error.InvalidDialogOptions;
+    try validateDialogString(options.title, platform.max_dialog_title_bytes, true);
+    try validateDialogString(options.default_path, platform.max_dialog_path_bytes, true);
+    try validateDialogString(options.default_name, platform.max_dialog_path_bytes, true);
+    try validateDialogFilters(options.filters);
+}
+
+fn validateMessageDialogOptions(options: platform.MessageDialogOptions) !void {
+    try validateDialogString(options.title, platform.max_dialog_title_bytes, true);
+    try validateDialogString(options.message, platform.max_dialog_message_bytes, true);
+    try validateDialogString(options.informative_text, platform.max_dialog_message_bytes, true);
+    try validateDialogString(options.primary_button, platform.max_dialog_button_bytes, false);
+    try validateDialogString(options.secondary_button, platform.max_dialog_button_bytes, true);
+    try validateDialogString(options.tertiary_button, platform.max_dialog_button_bytes, true);
+}
+
+fn validateDialogFilters(filters: []const platform.FileFilter) !void {
+    var flattened_len: usize = 0;
+    for (filters) |filter| {
+        try validateDialogString(filter.name, platform.max_dialog_filter_name_bytes, true);
+        for (filter.extensions) |extension| {
+            try validateDialogString(extension, platform.max_dialog_filter_bytes, false);
+            if (std.mem.indexOfScalar(u8, extension, ';') != null) return error.InvalidDialogOptions;
+            flattened_len += extension.len;
+            if (flattened_len > platform.max_dialog_filter_bytes) return error.DialogFieldTooLarge;
+            flattened_len += 1;
+            if (flattened_len > platform.max_dialog_filter_bytes + 1) return error.DialogFieldTooLarge;
+        }
+    }
+}
+
+fn validateDialogString(value: []const u8, max_len: usize, allow_empty: bool) !void {
+    if (!allow_empty and value.len == 0) return error.InvalidDialogOptions;
+    if (value.len > max_len) return error.DialogFieldTooLarge;
+    for (value) |ch| {
+        if (ch == 0) return error.InvalidDialogOptions;
     }
 }
 
@@ -5261,6 +5327,25 @@ test "runtime denies built-in dialog bridge commands by default" {
 test "runtime validates native OS actions before platform dispatch" {
     var harness: TestHarness() = undefined;
     harness.init(.{});
+
+    var dialog_paths: [platform.max_dialog_paths_bytes]u8 = undefined;
+    try std.testing.expectError(error.InvalidDialogOptions, harness.runtime.showOpenDialog(.{}, dialog_paths[0..0]));
+    const long_dialog_title = [_]u8{'x'} ** (platform.max_dialog_title_bytes + 1);
+    try std.testing.expectError(error.DialogFieldTooLarge, harness.runtime.showOpenDialog(.{ .title = &long_dialog_title }, &dialog_paths));
+    const open_result = try harness.runtime.showOpenDialog(.{ .title = "Open" }, &dialog_paths);
+    try std.testing.expectEqual(@as(usize, 1), open_result.count);
+    try std.testing.expectEqualStrings("/tmp/zero-native-open.txt", open_result.paths);
+
+    var save_path: [platform.max_dialog_path_bytes]u8 = undefined;
+    const saved = (try harness.runtime.showSaveDialog(.{ .default_name = "report.txt" }, &save_path)).?;
+    try std.testing.expectEqualStrings("report.txt", saved);
+
+    try std.testing.expectError(error.InvalidDialogOptions, harness.runtime.showMessageDialog(.{ .primary_button = "" }));
+    const dialog_result = try harness.runtime.showMessageDialog(.{ .message = "Proceed?", .primary_button = "OK" });
+    try std.testing.expectEqual(platform.MessageDialogResult.primary, dialog_result);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.open_dialog_count);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.save_dialog_count);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.message_dialog_count);
 
     try std.testing.expectError(error.InvalidNotificationOptions, harness.runtime.showNotification(.{ .title = "" }));
     try harness.runtime.showNotification(.{

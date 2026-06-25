@@ -47,6 +47,8 @@ pub const Error = error{
     RevealPathTooLarge,
     InvalidRecentDocumentPath,
     RecentDocumentPathTooLarge,
+    InvalidDialogOptions,
+    DialogFieldTooLarge,
     InvalidNotificationOptions,
     NotificationFieldTooLarge,
     InvalidClipboardOptions,
@@ -494,6 +496,11 @@ pub const BridgeMessage = struct {
 
 pub const max_dialog_path_bytes: usize = 4096;
 pub const max_dialog_paths_bytes: usize = 16 * 4096;
+pub const max_dialog_title_bytes: usize = 512;
+pub const max_dialog_message_bytes: usize = 4096;
+pub const max_dialog_button_bytes: usize = 128;
+pub const max_dialog_filter_name_bytes: usize = 256;
+pub const max_dialog_filter_bytes: usize = 1024;
 
 pub const FileFilter = struct {
     name: []const u8,
@@ -991,6 +998,10 @@ pub const NullPlatform = struct {
     recent_document_path: [max_recent_document_path_bytes]u8 = undefined,
     recent_document_path_len: usize = 0,
     recent_documents_cleared_count: usize = 0,
+    open_dialog_count: usize = 0,
+    save_dialog_count: usize = 0,
+    message_dialog_count: usize = 0,
+    message_dialog_result: MessageDialogResult = .primary,
     notification_title: [max_notification_title_bytes]u8 = undefined,
     notification_title_len: usize = 0,
     notification_subtitle: [max_notification_subtitle_bytes]u8 = undefined,
@@ -1072,6 +1083,9 @@ pub const NullPlatform = struct {
                 .set_webview_zoom_fn = setWebViewZoom,
                 .set_webview_layer_fn = setWebViewLayer,
                 .close_webview_fn = closeWebView,
+                .show_open_dialog_fn = showOpenDialog,
+                .show_save_dialog_fn = showSaveDialog,
+                .show_message_dialog_fn = showMessageDialog,
                 .show_notification_fn = showNotification,
                 .set_credential_fn = setCredential,
                 .get_credential_fn = getCredential,
@@ -1402,6 +1416,30 @@ pub const NullPlatform = struct {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
         self.removeWebViewAt(index);
+    }
+
+    fn showOpenDialog(context: ?*anyopaque, options: OpenDialogOptions, buffer: []u8) anyerror!OpenDialogResult {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        _ = options;
+        const path = "/tmp/zero-native-open.txt";
+        const copied = try copyInto(buffer, path);
+        self.open_dialog_count += 1;
+        return .{ .count = 1, .paths = copied };
+    }
+
+    fn showSaveDialog(context: ?*anyopaque, options: SaveDialogOptions, buffer: []u8) anyerror!?[]const u8 {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const path = if (options.default_name.len > 0) options.default_name else "/tmp/zero-native-save.txt";
+        const copied = try copyInto(buffer, path);
+        self.save_dialog_count += 1;
+        return copied;
+    }
+
+    fn showMessageDialog(context: ?*anyopaque, options: MessageDialogOptions) anyerror!MessageDialogResult {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        _ = options;
+        self.message_dialog_count += 1;
+        return self.message_dialog_result;
     }
 
     fn showNotification(context: ?*anyopaque, options: NotificationOptions) anyerror!void {
