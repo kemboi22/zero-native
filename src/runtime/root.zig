@@ -1128,6 +1128,7 @@ pub const Runtime = struct {
         const source = options.source orelse self.loaded_source orelse return error.MissingWindowSource;
         const id = if (options.id != 0) options.id else self.allocateWindowId();
         const label = if (options.label.len > 0) options.label else return error.InvalidWindowOptions;
+        try validateWindowFrame(options.default_frame);
         if (self.findWindowIndexById(id) != null) return error.DuplicateWindowId;
         if (self.findWindowIndexByLabel(label) != null) return error.DuplicateWindowLabel;
         const index = try self.reserveWindow(id, label, options.title, source, source_reloads_from_app);
@@ -1545,11 +1546,11 @@ pub const Runtime = struct {
 
     fn dispatchDialogBridgeCommand(self: *Runtime, request: bridge.Request, result_buffer: []u8, response_buffer: []u8) []const u8 {
         const result = if (std.mem.eql(u8, request.command, "zero-native.dialog.openFile"))
-            self.openFileDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, .internal_error, builtinBridgeErrorMessage(err))
+            self.openFileDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
         else if (std.mem.eql(u8, request.command, "zero-native.dialog.saveFile"))
-            self.saveFileDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, .internal_error, builtinBridgeErrorMessage(err))
+            self.saveFileDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
         else if (std.mem.eql(u8, request.command, "zero-native.dialog.showMessage"))
-            self.showMessageDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, .internal_error, builtinBridgeErrorMessage(err))
+            self.showMessageDialogFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
         else
             return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown dialog command");
         return bridge.writeSuccessResponse(response_buffer, request.id, result);
@@ -3754,6 +3755,11 @@ fn webViewFrameFromJson(payload: []const u8) !geometry.RectF {
     return frame;
 }
 
+fn validateWindowFrame(frame: geometry.RectF) !void {
+    if (!std.math.isFinite(frame.x) or !std.math.isFinite(frame.y) or !std.math.isFinite(frame.width) or !std.math.isFinite(frame.height)) return error.InvalidWindowOptions;
+    if (frame.width <= 0 or frame.height <= 0) return error.InvalidWindowOptions;
+}
+
 fn webViewLayerFromJson(payload: []const u8) !i32 {
     if (json.fieldValue(payload, "layer") == null) return 0;
     const layer_bytes = json.fieldValue(payload, "layer") orelse return error.InvalidWebViewOptions;
@@ -5528,6 +5534,16 @@ test "runtime handles built-in JavaScript window bridge commands" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "already exists") != null);
 
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"bad-frame\",\"command\":\"zero-native.window.create\",\"payload\":{\"label\":\"bad-frame\",\"width\":0,\"height\":240}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "Window options are invalid") != null);
+    var invalid_frame_windows: [platform.max_windows]platform.WindowInfo = undefined;
+    try std.testing.expectEqual(@as(usize, 2), harness.runtime.listWindows(&invalid_frame_windows).len);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
         .bytes = "{\"id\":\"2\",\"command\":\"zero-native.window.list\",\"payload\":null}",
         .origin = "zero://inline",
         .window_id = 1,
@@ -6786,6 +6802,29 @@ test "runtime denies built-in dialog bridge commands by default" {
     } });
 
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"permission_denied\"") != null);
+}
+
+test "runtime reports dialog bridge validation errors as invalid requests" {
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    const app = App{ .context = &harness, .name = "dialog-invalid", .source = platform.WebViewSource.html("<p>Dialogs</p>") };
+    const dialog_permission = [_][]const u8{security.permission_dialog};
+    const dialog_policy = [_]bridge.CommandPolicy{.{
+        .name = "zero-native.dialog.showMessage",
+        .permissions = &dialog_permission,
+        .origins = &.{"zero://inline"},
+    }};
+    harness.runtime.options.security.permissions = &dialog_permission;
+    harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &dialog_policy };
+
+    try harness.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"invalid-dialog\",\"command\":\"zero-native.dialog.showMessage\",\"payload\":{\"primaryButton\":\"\"}}",
+        .origin = "zero://inline",
+    } });
+
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"internal_error\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "Dialog options are invalid") != null);
 }
 
 test "runtime validates native OS actions before platform dispatch" {
